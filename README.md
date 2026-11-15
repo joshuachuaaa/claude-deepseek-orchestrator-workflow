@@ -230,3 +230,7 @@ This is new. The script has been exercised end to end against scratch
 repositories with a stand-in worker, but there are no measurements from real
 tasks yet, so no claim is made here about cost or quality against a single
 model.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
