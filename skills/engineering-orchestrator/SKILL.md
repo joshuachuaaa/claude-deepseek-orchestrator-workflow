@@ -1,7 +1,7 @@
 ---
 name: engineering-orchestrator
 disable-model-invocation: true
-description: Plan, build, review and accept a substantial coding task with Opus 5.5 as the working session, Fable 5.2 as architect and final sign-off (subagents), and a worker in OpenCode (DeepSeek V4.1 Flash or GPT-6.2 Sol) for large machine-checkable implementation. Use for implementation work in a git repository that is a new feature, module or endpoint, a refactor across several files, or roughly 150+ lines of new code. Do not use for questions, explanations, reviews of existing code, config changes, or fixes whose cause is already known.
+description: Plan, build, review and accept a substantial coding task with Opus 5.5 as the working session, Fable 5.2 as architect and final sign-off (subagents), and a worker in OpenCode (GPT-6.2 Sol, or DeepSeek V4.1 Flash) for large machine-checkable implementation. Use for implementation work in a git repository that is a new feature, module or endpoint, a refactor across several files, or roughly 150+ lines of new code. Do not use for questions, explanations, reviews of existing code, config changes, or fixes whose cause is already known.
 ---
 
 # Engineering orchestrator
@@ -20,12 +20,12 @@ description: Plan, build, review and accept a substantial coding task with Opus 
 - **test-runner (subagent, Haiku).** Runs `delegate verify` and returns a short
   result.
 - **Worker: an OpenCode agent run by `delegate`.** Types the code from a brief,
-  in its own git worktree. There are two: DeepSeek V4.1 Flash at max effort
-  (`deepseek`), and GPT-6.2 Sol (`sol`) at high effort for an implementation
-  round and xhigh for a correction round. The user chooses which one; you never
-  do. It is the one the user names in the request, otherwise the default that
-  `delegate check` prints (set by `ENG_ORCH_TYPIST`). Pass `--typist` to
-  `delegate start` only when the user named one.
+  in its own git worktree. There are two: GPT-6.2 Sol (`sol`, the default) at
+  high effort for an implementation round and xhigh for a correction round, and
+  DeepSeek V4.1 Flash at max effort (`deepseek`). The user chooses which one; you
+  never do. It is the one the user names in the request, otherwise the default
+  that `delegate check` prints (Sol, unless `ENG_ORCH_TYPIST` says otherwise).
+  Pass `--typist` to `delegate start` only when the user named one.
 
 Fable is never the main model and never the `/advisor`: both would make it read
 the whole conversation. It only ever reads a dossier, a sign-off package or a

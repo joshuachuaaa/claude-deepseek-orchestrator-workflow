@@ -8,7 +8,7 @@ and xhigh for a correction round. There is no fallback model: if a worker's mode
 be reached, or a round turns out to have been served by anything else, this script fails
 loudly. With `start --typist opus` the typist is a Claude Code subagent (`opus-typist`)
 that the driver calls itself: `start` and `fix` then only open a round, and
-`delegate round` closes it. The default typist is $ENG_ORCH_TYPIST, or deepseek.
+`delegate round` closes it. The default typist is $ENG_ORCH_TYPIST, or sol.
 
 With `start --check CMD` the script runs CMD itself when a worker says it has finished,
 and sends a failure straight back into the worker's session (once per round) before the
@@ -61,7 +61,7 @@ WORKERS = {
                 agent="eng-implementer-sol", credential="openai"),
 }
 TYPISTS = (*WORKERS, "opus")
-DEFAULT_TYPIST = os.environ.get("ENG_ORCH_TYPIST", "deepseek")
+DEFAULT_TYPIST = os.environ.get("ENG_ORCH_TYPIST", "sol")
 OPT_OUT_MARKER = ".no-delegate"
 
 # The self-check (`start --check CMD`): how many times a failure is sent back to the worker

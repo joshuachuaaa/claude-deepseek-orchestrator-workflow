@@ -7,14 +7,14 @@ in the seat it is best at:
 |---|---|---|---|
 | Driver | the main Claude Code session | Opus 5.5, xhigh effort | explores, writes the acceptance tests, reviews, verifies, takes over when needed, reports |
 | Judge | `fable-architect` and `fable-signoff` subagents | Fable 5.2, high effort | designs risky or unclear changes, signs off the finished change, answers one consult |
-| Typist | `eng-implementer` or `eng-implementer-sol` agent in [OpenCode](https://opencode.ai) | DeepSeek V4.1 Flash, or GPT-6.2 Sol | types the code from a written brief, in its own git worktree |
+| Typist | `eng-implementer-sol` or `eng-implementer` agent in [OpenCode](https://opencode.ai) | GPT-6.2 Sol by default, or DeepSeek V4.1 Flash | types the code from a written brief, in its own git worktree |
 
 Two helpers keep the driver's context small: the built-in Explore subagent does
 the searching, and a `test-runner` subagent (Haiku 5.5) runs the gate and returns
 a short result.
 
-A Claude-only version of the same pipeline, with an Opus typist instead of
-DeepSeek, is in
+A Claude-only version of the same pipeline, with an Opus typist instead of an
+OpenCode worker, is in
 [claude-orchestrator-workflow](https://github.com/joshuachuaaa/claude-orchestrator-workflow).
 
 ## The idea
@@ -136,23 +136,25 @@ sequenceDiagram
 
 ## The two workers
 
-| | `deepseek` | `sol` |
+| | `sol` (default) | `deepseek` |
 |---|---|---|
-| Model in OpenCode | `lithosai/deepseek-ai/DeepSeek-V4.1-Flash` | `openai/gpt-6.2-sol` |
-| Effort, implementation round | max | high |
-| Effort, correction round (`delegate fix`) | max | xhigh |
-| Brief | spells out the internal structure | exact contracts and files to read; internals left to the worker |
-| Worth dispatching from | about 200 lines | about 100 lines |
+| Model in OpenCode | `openai/gpt-6.2-sol` | `lithosai/deepseek-ai/DeepSeek-V4.1-Flash` |
+| Effort, implementation round | high | max |
+| Effort, correction round (`delegate fix`) | xhigh | max |
+| Brief | exact contracts and files to read; internals left to the worker | spells out the internal structure |
+| Worth dispatching from | about 100 lines | about 200 lines |
 
-DeepSeek is the default. To make Sol the default, set `ENG_ORCH_TYPIST=sol` in
-your shell profile; to use it for one task, name it in the request (the driver
-then passes `--typist sol`). `delegate check` prints which one is in force.
+Sol is the default. To use DeepSeek for one task, name it in the request (the
+driver then passes `--typist deepseek`); to make DeepSeek the default, set
+`ENG_ORCH_TYPIST=deepseek` in your shell profile. `delegate check` prints which
+one is in force.
 
-Sol costs many times what DeepSeek does per token, so it cannot make the typist
-seat cheaper. It pays for itself only if it takes work off the driver: fewer
-correction rounds, fewer takeovers, shorter briefs. `delegate stats` has a
-`by typist` section so you can see whether it does on your own tasks. Run some
-tasks on each before deciding.
+Sol costs many times what DeepSeek does per token, so it does not make the
+typist seat cheaper. It is the default because the driver is the expensive
+seat, and a stronger typist is expected to take work off it: fewer correction
+rounds, fewer takeovers, shorter briefs. That is an expectation, not a
+measurement. `delegate stats` has a `by typist` section so you can check it on
+your own tasks; run a few on DeepSeek to compare.
 
 Sol's effort ladder is deliberate. High is used for implementation because
 launch-week measurements put xhigh about one index point above high for more
@@ -182,8 +184,8 @@ command leaves behind are removed, so they never reach the diff.
 ## Requirements
 
 - Claude Code with access to Opus 5.5, Fable 5.2 and Haiku 5.5
-- OpenCode with a provider that serves DeepSeek V4.1 Flash, or with OpenAI
-  signed in for GPT-6.2 Sol, or both
+- OpenCode with OpenAI signed in for GPT-6.2 Sol (the default typist), or with
+  a provider that serves DeepSeek V4.1 Flash, or both
 - git and Python 3
 
 Each worker's model is named in two places: the `model:` line of its agent file
@@ -213,11 +215,11 @@ agents into `~/.config/opencode/agents`, and links `delegate` into
 Then, inside a git repository, check the worker you mean to use:
 
 ```bash
-delegate check --typist deepseek
+delegate check --typist sol
 ```
 
 ```bash
-delegate check --typist sol
+delegate check --typist deepseek
 ```
 
 To avoid permission prompts for the script and its task folders, add these to
@@ -295,8 +297,10 @@ tasks yet, so no claim is made here about cost or quality against a single
 model. That includes the Sol worker, the effort ladder and the self-check: they
 have run against the stand-in only, not against GPT-6.2 Sol in OpenCode, and
 the OpenCode ids for Sol (`openai/gpt-6.2-sol`, variants `high` and `xhigh`) are
-the expected ones, not confirmed ones. `delegate check --typist sol` will tell
-you if they are wrong.
+the expected ones, not confirmed ones. Sol is the default typist, so run
+`delegate check` before the first task: it will tell you if they are wrong.
+Until they are right, `ENG_ORCH_TYPIST=deepseek` keeps the DeepSeek worker in
+use.
 
 ## License
 
