@@ -71,7 +71,9 @@ brief literally: give it the internal structure as well as the contracts. Sol
 needs the contracts exact (names, signatures, behaviour at the boundaries) and
 the files to read first; leave the internal structure to it, and keep the brief
 short. For either worker, name every file it needs to read: it should not have
-to search the repository.
+to search the repository. Sol works in a sandbox with no network and cannot
+commit: give it a test command that runs offline, and do not ask it to install
+packages or to commit.
 
 ### holdback.md (never sent to the worker)
 Two to five checks that neither the acceptance tests nor the worker's own tests

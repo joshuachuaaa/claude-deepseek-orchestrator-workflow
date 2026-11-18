@@ -1,7 +1,8 @@
 #!/bin/sh
 # Installs the engineering-orchestrator workflow:
 #   - the skill and its subagents into Claude Code
-#   - the two worker agents (DeepSeek, GPT-6.2 Sol) into OpenCode
+#   - the DeepSeek worker's agent into OpenCode (GPT-6.2 Sol runs through the
+#     Codex CLI and needs no agent file)
 #   - `delegate` onto your PATH
 # A file that already exists and differs is left alone unless you pass --force.
 set -eu
@@ -34,9 +35,7 @@ put "$here/$skill/templates/dossier.md"  "$claude/$skill/templates/dossier.md"
 for agent in fable-architect fable-signoff test-runner; do
     put "$here/agents/$agent.md" "$claude/agents/$agent.md"
 done
-for agent in eng-implementer eng-implementer-sol; do
-    put "$here/opencode/agents/$agent.md" "$opencode/agents/$agent.md"
-done
+put "$here/opencode/agents/eng-implementer.md" "$opencode/agents/eng-implementer.md"
 
 target=$claude/$skill/scripts/delegate
 chmod +x "$target"
@@ -54,4 +53,4 @@ else
 fi
 
 echo
-echo "Next: make sure $bin is on your PATH, then run 'delegate check' inside a git repository."
+echo "Next: make sure $bin is on your PATH, sign in with 'codex login', then run 'delegate check' inside a git repository."

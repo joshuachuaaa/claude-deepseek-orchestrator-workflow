@@ -1,7 +1,7 @@
 ---
 name: engineering-orchestrator
 disable-model-invocation: true
-description: Plan, build, review and accept a substantial coding task with Opus 5.5 as the working session, Fable 5.2 as architect and final sign-off (subagents), and a worker in OpenCode (GPT-6.2 Sol, or DeepSeek V4.1 Flash) for large machine-checkable implementation. Use for implementation work in a git repository that is a new feature, module or endpoint, a refactor across several files, or roughly 150+ lines of new code. Do not use for questions, explanations, reviews of existing code, config changes, or fixes whose cause is already known.
+description: Plan, build, review and accept a substantial coding task with Opus 5.5 as the working session, Fable 5.2 as architect and final sign-off (subagents), and a worker (GPT-6.2 Sol through the Codex CLI, or DeepSeek V4.1 Flash through OpenCode) for large machine-checkable implementation. Use for implementation work in a git repository that is a new feature, module or endpoint, a refactor across several files, or roughly 150+ lines of new code. Do not use for questions, explanations, reviews of existing code, config changes, or fixes whose cause is already known.
 ---
 
 # Engineering orchestrator
@@ -19,11 +19,12 @@ description: Plan, build, review and accept a substantial coding task with Opus 
 - **Explore (built-in subagent, Haiku).** All repository searching.
 - **test-runner (subagent, Haiku).** Runs `delegate verify` and returns a short
   result.
-- **Worker: an OpenCode agent run by `delegate`.** Types the code from a brief,
-  in its own git worktree. There are two: GPT-6.2 Sol (`sol`, the default) at
-  high effort for an implementation round and xhigh for a correction round, and
-  DeepSeek V4.1 Flash at max effort (`deepseek`). The user chooses which one; you
-  never do. It is the one the user names in the request, otherwise the default
+- **Worker: a model that `delegate` runs through its own CLI.** Types the code
+  from a brief, in its own git worktree. There are two: GPT-6.2 Sol through the
+  Codex CLI (`sol`, the default), at high effort for an implementation round and
+  xhigh for a correction round, and DeepSeek V4.1 Flash through OpenCode at max
+  effort (`deepseek`). You never talk to a worker: you write a file and run
+  `delegate`. The user chooses which worker; you never do. It is the one the user names in the request, otherwise the default
   that `delegate check` prints (Sol, unless `ENG_ORCH_TYPIST` says otherwise).
   Pass `--typist` to `delegate start` only when the user named one.
 
@@ -72,7 +73,8 @@ regardless and say so.
    (names, signatures, behaviour at the boundaries); the internals need not be
    designed in advance.
 3. The result is machine-checkable: you can write acceptance tests for it before
-   any code exists.
+   any code exists. For Sol those tests must run without the network: its
+   sandbox has none.
 4. The brief will be much shorter than the work it replaces. If specifying the
    change takes about as much as writing it, you type.
 5. The repository is a git repository with at least one commit.
@@ -173,6 +175,11 @@ when Fable designed (this makes sign-off mandatory). Pass `--signoff` when you
 designed but the change is risky. Run it with the Bash tool's
 `run_in_background` and wait for it to finish; do not poll more than every few
 minutes. After it starts, give the user the `resume` command it prints.
+
+Sol runs in Codex's sandbox: it can write only inside its worktree, its
+commands have no network, and it cannot commit (the script commits what it
+leaves). So the brief's test command must run offline: no package installs, no
+calls to outside services.
 
 For several pieces (decision D), start each as its own task in the background at
 the same time, then take each through Steps 5 to 7 on its own.
@@ -306,8 +313,8 @@ risks and anything you could not verify.
 `delegate stats` keeps these numbers across tasks: the share of tasks that passed
 their first verification, the share you took over, how often sign-off returned
 CHANGES, and the tokens each seat read and wrote. Its `by typist` lines give
-the first-pass rate, takeovers, self-check recoveries and OpenCode's reported
-cost for each worker. They show whether the worker is paying for itself.
+the first-pass rate, takeovers, self-check recoveries, and the cost OpenCode
+reports or the tokens Codex reports, for each worker. They show whether the worker is paying for itself.
 
 After reporting, tell the user to run `/clear` before the next unrelated task.
 The token count for a task starts at the session's start, so a fresh session per
@@ -342,7 +349,7 @@ task keeps the numbers clean.
 
 ## Commands
 
-    delegate check [--typist deepseek|sol]   preflight: which worker, opencode, model, agent, credentials
+    delegate check [--typist sol|deepseek]   preflight: which worker, its CLI, model, sandbox or agent, sign-in
     delegate takeover <task> --reason "..."   you take the task over from the worker
     delegate status [<task>]       rounds, verification, sign-off, session
     delegate stats                 every task so far: rounds, first-pass rate, takeovers, CHANGES rate, tokens by seat

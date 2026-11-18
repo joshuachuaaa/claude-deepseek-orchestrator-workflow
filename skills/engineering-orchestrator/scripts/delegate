@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """delegate - bridge between Claude Code (Opus reviewer, Fable architect) and the typist.
 
-Three typists. Two are OpenCode workers (see WORKERS below): `deepseek`, agent
-`eng-implementer` on lithosai/deepseek-ai/DeepSeek-V4.1-Flash#max, and `sol`, agent
-`eng-implementer-sol` on openai/gpt-6.2-sol, at high effort for an implementation round
-and xhigh for a correction round. There is no fallback model: if a worker's model cannot
-be reached, or a round turns out to have been served by anything else, this script fails
-loudly. With `start --typist opus` the typist is a Claude Code subagent (`opus-typist`)
-that the driver calls itself: `start` and `fix` then only open a round, and
-`delegate round` closes it. The default typist is $ENG_ORCH_TYPIST, or sol.
+Three typists. Two are workers this script runs itself (see WORKERS below). `sol` is
+GPT-6.2 Sol through the Codex CLI (`codex exec`, in the workspace-write sandbox), at high
+effort for an implementation round and xhigh for a correction round. `deepseek` is the
+OpenCode agent `eng-implementer` on lithosai/deepseek-ai/DeepSeek-V4.1-Flash#max. There is
+no fallback model: if a worker's model cannot be reached, or a round turns out to have
+been run with anything else, this script fails loudly. With `start --typist opus` the
+typist is a Claude Code subagent (`opus-typist`) that the driver calls itself: `start` and
+`fix` then only open a round, and `delegate round` closes it. The default typist is
+$ENG_ORCH_TYPIST, or sol.
 
 With `start --check CMD` the script runs CMD itself when a worker says it has finished,
 and sends a failure straight back into the worker's session (once per round) before the
@@ -18,9 +19,9 @@ Everything the orchestrator reviews is produced here (diff, commit, test exit co
 not taken from the typist's own report.
 
 Commands (run from inside the project's git repository):
-  delegate check [--typist deepseek|sol]
+  delegate check [--typist sol|deepseek]
   delegate prep <task>                      planning folder + dossier template
-  delegate start <task> --spec FILE [--typist deepseek|sol|opus] [--tests DIR] [--check CMD]
+  delegate start <task> --spec FILE [--typist sol|deepseek|opus] [--tests DIR] [--check CMD]
                         [--plan FILE] [--signoff] [--base REF] [--timeout MIN]
   delegate fix <task> --feedback FILE [--stage] [--check CMD] [--timeout MIN]
   delegate round <task>                     close a round typed by the opus-typist subagent
@@ -48,18 +49,32 @@ import sys
 import time
 from pathlib import Path
 
-# The OpenCode workers. `variant` is the reasoning effort for an implementation round and
-# `fix_variant` the one for a correction round. Each worker's model is also named in the
-# `model:` line of its agent file, and `check` refuses if the two disagree. `credential`
-# is the text looked for in `opencode auth list`.
+# The workers. `runner` is the CLI that drives the model: `sol` goes through the Codex CLI
+# (`codex exec`), `deepseek` through OpenCode (`opencode run`). `variant` is the reasoning
+# effort for an implementation round and `fix_variant` the one for a correction round.
+# The Codex worker needs no agent file: its limits are the sandbox named on the command
+# line, and $ENG_ORCH_SOL_MODEL puts another Codex model in the seat. The OpenCode worker's
+# model is also named in the `model:` line of its agent file, and `check` refuses if the
+# two disagree; `credential` is the text looked for in `opencode auth list`.
+SOL_MODEL = os.environ.get("ENG_ORCH_SOL_MODEL", "gpt-6.2-sol")
 WORKERS = {
-    "deepseek": dict(label="DeepSeek V4.1 Flash", provider="lithosai",
+    "sol": dict(label="GPT-6.2 Sol" if SOL_MODEL == "gpt-6.2-sol" else SOL_MODEL, runner="codex",
+                provider="openai", model_id=SOL_MODEL, variant="high", fix_variant="xhigh"),
+    "deepseek": dict(label="DeepSeek V4.1 Flash", runner="opencode", provider="lithosai",
                      model_id="deepseek-ai/DeepSeek-V4.1-Flash", variant="max", fix_variant="max",
                      agent="eng-implementer", credential="lithos"),
-    "sol": dict(label="GPT-6.2 Sol", provider="openai",
-                model_id="gpt-6.2-sol", variant="high", fix_variant="xhigh",
-                agent="eng-implementer-sol", credential="openai"),
 }
+RUNNER_NAME = {"codex": "Codex", "opencode": "OpenCode"}
+
+
+def codex_exe():
+    """The full path: an npm install is a `codex.cmd` shim on Windows, which a bare name does not find."""
+    return shutil.which("codex") or "codex"
+
+# Codex confines the worker's writes to the worktree (and the temp directory) and gives its
+# commands no network. The repository's git directory is outside the worktree, so the worker
+# cannot commit; the script commits for it.
+CODEX_SANDBOX = "workspace-write"
 TYPISTS = (*WORKERS, "opus")
 DEFAULT_TYPIST = os.environ.get("ENG_ORCH_TYPIST", "sol")
 OPT_OUT_MARKER = ".no-delegate"
@@ -101,8 +116,7 @@ Rules:
   real outcome. Never weaken, skip or delete a test to make it pass.
 - Long-running commands: run them in the foreground with their own timeout; do not
   leave background processes behind.
-- You may commit on this branch. Do not push, merge, switch branches, or touch git
-  configuration.
+@GIT_RULE@
 - If the brief is wrong, contradictory or impossible, STOP and say so under BLOCKERS
   instead of improvising.
 
@@ -115,6 +129,14 @@ Finish with exactly this report:
 ### Deviations from the brief
 ### Blockers
 """
+
+GIT_RULE = {
+    "opencode": "- You may commit on this branch. Do not push, merge, switch branches, or touch git\n"
+                "  configuration.",
+    "codex": "- Do not commit, push, merge, switch branches, or touch git configuration. Your sandbox\n"
+             "  cannot write to the repository's git directory; the script commits your work when\n"
+             "  you finish.",
+}
 
 
 class Fail(Exception):
@@ -139,7 +161,8 @@ def env_in(cwd):
 
 
 def run(cmd, cwd=None, check=True, timeout=None):
-    p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=timeout, env=env_in(cwd))
+    p = subprocess.run(cmd, cwd=cwd, text=True, encoding="utf-8", errors="replace", capture_output=True,
+                       timeout=timeout, env=env_in(cwd))
     if check and p.returncode != 0:
         raise Fail(f"command failed ({p.returncode}): {shlex.join(cmd)}\n{p.stderr.strip() or p.stdout.strip()}")
     return p
@@ -261,6 +284,47 @@ def model_of(w, fix=False):
 
 def preflight(typist, verbose=False):
     w = WORKERS[typist]
+    (preflight_codex if w["runner"] == "codex" else preflight_opencode)(typist, w, verbose)
+
+
+def preflight_codex(typist, w, verbose):
+    if not shutil.which("codex"):
+        raise Fail("codex is not on PATH (npm install -g @openai/codex).")
+    try:
+        catalog = json.loads(run([codex_exe(), "debug", "models"], timeout=120).stdout).get("models") or []
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        raise Fail("`codex debug models` did not print a model catalog. Update the Codex CLI (`codex update`).")
+    entry = next((m for m in catalog if m.get("slug") == w["model_id"]), None)
+    if not entry:
+        offered = ", ".join(sorted(m.get("slug", "?") for m in catalog if m.get("visibility") != "hide"))
+        raise Fail(
+            f"model {w['model_id']} is not in the Codex model catalog on this machine.\n"
+            f"Offered here: {offered or 'nothing'}.\n"
+            "No substitute will be used. Update the Codex CLI (`codex update`), or name the model for the "
+            "Sol seat in $ENG_ORCH_SOL_MODEL."
+        )
+    levels = {x.get("effort") if isinstance(x, dict) else x for x in entry.get("supported_reasoning_levels") or []}
+    missing = [v for v in (w["variant"], w["fix_variant"]) if levels and v not in levels]
+    if missing:
+        raise Fail(f"model {w['model_id']} does not offer effort {' or '.join(missing)} in Codex "
+                   f"(it offers {', '.join(sorted(levels))}).")
+    login = run([codex_exe(), "login", "status"], check=False, timeout=60)
+    lines = [x.strip() for x in (login.stdout + login.stderr).splitlines() if x.strip()]
+    how = next((x for x in lines if x.lower().startswith("logged in")), None)
+    signed_in = login.returncode == 0 and how is not None
+    if verbose:
+        ver = run([codex_exe(), "--version"]).stdout.strip()
+        print(f"ok  typist        {typist} ({w['label']})")
+        print(f"ok  codex         {ver}")
+        print(f"ok  model         {model_of(w)}"
+              + (f"   corrections: {model_of(w, fix=True)}" if w["fix_variant"] != w["variant"] else ""))
+        print(f"ok  sandbox       {CODEX_SANDBOX} (writes stay in the worktree; no network)")
+        print(f"{'ok ' if signed_in else 'NO '} sign-in       {how if signed_in else 'NOT SIGNED IN (codex login)'}")
+    if not signed_in:
+        raise Fail("Codex is not signed in. Run `codex login`.")
+
+
+def preflight_opencode(typist, w, verbose):
     name, agent = f"{w['provider']}/{w['model_id']}", w["agent"]
     if not shutil.which("opencode"):
         raise Fail("opencode is not on PATH.")
@@ -292,7 +356,54 @@ def preflight(typist, verbose=False):
             raise Fail(f"no {w['provider']} credential in OpenCode.")
 
 
-def session_record(session_id, cwd):
+def session_record(w, session_id, cwd):
+    """(model and effort of each turn, directory the session ran in, token usage so far, sandbox
+    modes), from the runner's own record of the session. The last is None for OpenCode, whose
+    limits are the agent file's permission list."""
+    if w["runner"] == "codex":
+        return codex_record(session_id, cwd)
+    return (*opencode_record(session_id, cwd), None)
+
+
+def codex_usage(u):
+    """Codex counts cached input inside input_tokens, and keeps one running total per session."""
+    cached = u.get("cached_input_tokens") or 0
+    return {"in": max((u.get("input_tokens") or 0) - cached, 0), "cache_read": cached,
+            "cache_write": u.get("cache_write_input_tokens") or 0, "out": u.get("output_tokens") or 0,
+            "cost": None}
+
+
+def codex_record(session_id, cwd):
+    """Read the session file Codex keeps (`rollout-*-<id>.jsonl`): a `turn_context` line per turn
+    names the model, the effort, the directory and the sandbox that turn ran with."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    files = sorted(home.glob(f"sessions/**/rollout-*{session_id}.jsonl"))
+    if not files:
+        return None, None, None, None
+    provider, seen, sandboxes, dirs, usage = "openai", set(), set(), [], None
+    for line in files[-1].read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        p = rec.get("payload")
+        if not isinstance(p, dict):
+            continue
+        if rec.get("type") == "session_meta":
+            provider = p.get("model_provider") or provider
+            dirs.append(p.get("cwd"))
+        elif rec.get("type") == "turn_context":
+            seen.add(f"{provider}/{p.get('model')}#{p.get('effort')}")
+            sandboxes.add(str((p.get("sandbox_policy") or {}).get("type")))
+            dirs.append(p.get("cwd"))
+        elif p.get("type") == "token_count" and isinstance((p.get("info") or {}).get("total_token_usage"), dict):
+            usage = codex_usage(p["info"]["total_token_usage"])
+    dirs = [x for x in dirs if x]
+    elsewhere = [x for x in dirs if Path(x).resolve() != Path(cwd).resolve()]
+    return seen or None, (elsewhere or dirs or [None])[0], usage, sandboxes or None
+
+
+def opencode_record(session_id, cwd):
     """(models that actually answered, directory the session ran in, token usage so far),
     from OpenCode's own record."""
     p = run(["opencode", "session", "export", session_id], cwd=cwd, check=False, timeout=120)
@@ -322,9 +433,63 @@ def session_record(session_id, cwd):
 
 # ---------------------------------------------------------------- one worker round
 
+def worker_turn(st, w, model, message, stem, timeout_s):
+    """One turn of the worker in the task's session, through its runner.
+    Returns (exit code, timed out, the worker's last message, errors the runner reported, stderr log)."""
+    turn = codex_turn if w["runner"] == "codex" else opencode_turn
+    return turn(st, w, model, message, stem, timeout_s)
+
+
+def codex_turn(st, w, model, message, stem, timeout_s):
+    """One `codex exec` in the task's session. The message goes in on stdin."""
+    d, wt = Path(st["state_dir"]), st["worktree"]
+    events, errlog = d / f"{stem}.events.jsonl", d / f"{stem}.stderr.log"
+    effort = model.rsplit("#", 1)[1]
+    opts = ["--json", "-m", w["model_id"], "-c", f'model_reasoning_effort="{effort}"']
+    if st.get("session_id"):
+        # `resume` takes neither -s nor -C: the sandbox goes in as a config value, the directory as cwd.
+        cmd = [codex_exe(), "exec", "resume", st["session_id"], *opts, "-c", f'sandbox_mode="{CODEX_SANDBOX}"', "-"]
+    else:
+        cmd = [codex_exe(), "exec", *opts, "-s", CODEX_SANDBOX, "-C", wt, "-"]
+    timed_out = False
+    with open(events, "w") as out, open(errlog, "w") as err:
+        try:
+            rc = subprocess.run(cmd, cwd=wt, env=env_in(wt), input=message.encode(), stdout=out, stderr=err,
+                                timeout=timeout_s).returncode
+        except subprocess.TimeoutExpired:
+            timed_out, rc = True, 124
+    report, errors, usage, finished = "", [], None, False
+    for line in events.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        kind, item = ev.get("type"), ev.get("item") or {}
+        if kind == "thread.started":
+            st["session_id"] = st.get("session_id") or ev.get("thread_id")
+        elif kind == "item.completed" and item.get("type") == "agent_message" and item.get("text"):
+            report = item["text"]   # the last message of the turn is the report
+        elif kind == "item.completed" and item.get("type") == "error":
+            note = "notice: " + str(item.get("message"))[:600]   # Codex's own notices; the turn goes on
+            if note not in errors:
+                errors.append(note)
+        elif kind in ("error", "turn.failed"):
+            errors.append(json.dumps(ev.get("error") or ev.get("message") or ev)[:600])
+            rc = rc or 1
+        elif kind == "turn.completed":
+            finished, usage = True, ev.get("usage") or usage
+    if rc == 0 and not finished:
+        errors.append("codex exited 0 without completing the turn")
+        rc = 1
+    if isinstance(usage, dict):
+        st["worker_usage"] = codex_usage(usage)
+    st["updated"] = now()
+    save_state(st)   # the session id must survive a crash, or the next round starts a new session
+    return rc, timed_out, report.strip(), errors, errlog
+
+
 def opencode_turn(st, w, model, message, stem, timeout_s):
-    """One `opencode run` in the task's session.
-    Returns (exit code, timed out, the worker's last message, errors OpenCode reported, stderr log)."""
+    """One `opencode run` in the task's session."""
     d, wt = Path(st["state_dir"]), st["worktree"]
     events, errlog = d / f"{stem}.events.jsonl", d / f"{stem}.stderr.log"
     cmd = ["opencode", "run", "--agent", w["agent"], "-m", model, "--auto", "--format", "json",
@@ -424,7 +589,8 @@ def worker_round(st, body, kind, timeout_min, fix=False):
             f"round limit reached ({MAX_ROUNDS}) for task '{st['task']}'. Do not keep looping:\n"
             "reassess the design, find the underlying blocker, and report to the user."
         )
-    brief = f"{WORKER_CONTRACT}\n---\n# {kind} (round {n}, task {st['task']})\n\n{body.strip()}\n"
+    contract = WORKER_CONTRACT.replace("@GIT_RULE@", GIT_RULE[w["runner"]])
+    brief = f"{contract}\n---\n# {kind} (round {n}, task {st['task']})\n\n{body.strip()}\n"
     if len(brief.encode()) > MAX_BRIEF_BYTES:
         raise Fail(f"brief is {len(brief.encode())} bytes; keep it under {MAX_BRIEF_BYTES}. Split the task.")
     (d / f"round-{n}.brief.md").write_text(brief)
@@ -432,7 +598,7 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     head_before = git(["rev-parse", "HEAD"], wt).stdout.strip()
     main_before = (git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout)
     deadline = time.monotonic() + timeout_min * 60
-    rc, timed_out, report, errors, errlog = opencode_turn(st, w, model, brief, f"round-{n}", timeout_min * 60)
+    rc, timed_out, report, errors, errlog = worker_turn(st, w, model, brief, f"round-{n}", timeout_min * 60)
     # Capture whatever the worker left behind, so the diff is complete and reviewable.
     committed = capture(st, f"worker round {n}")
 
@@ -447,8 +613,8 @@ def worker_round(st, body, kind, timeout_min, fix=False):
         left = deadline - time.monotonic()
         if passed or k > SELFCHECK_RETRIES or left < 120:
             break
-        rc, timed_out, again, more, errlog = opencode_turn(st, w, model, feedback, f"round-{n}.selfcheck-{k}", left)
-        report, errors = again or report, errors + more
+        rc, timed_out, again, more, errlog = worker_turn(st, w, model, feedback, f"round-{n}.selfcheck-{k}", left)
+        report, errors = again or report, errors + [e for e in more if e not in errors]
         committed = capture(st, f"worker round {n}, after self-check {k}") or committed
     (d / f"round-{n}.report.md").write_text(report + "\n")
     head_after = git(["rev-parse", "HEAD"], wt).stdout.strip()
@@ -462,11 +628,13 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     save_state(st)
 
     session_id = st.get("session_id")
-    served, ran_in, usage = session_record(session_id, wt) if session_id else (None, None, None)
+    served, ran_in, usage, sandboxes = session_record(w, session_id, wt) if session_id else (None,) * 4
     if usage:
         st["worker_usage"] = usage
         save_state(st)
     wrong = sorted(served - {model_of(w), model_of(w, fix=True)}) if served else []
+    unsandboxed = sorted(sandboxes - {CODEX_SANDBOX}) if sandboxes else []
+    codex = w["runner"] == "codex"
     main_after = (git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout)
     escaped = main_after != main_before
     misplaced = ran_in is not None and Path(ran_in).resolve() != Path(wt).resolve()
@@ -475,10 +643,13 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     print(f"worktree   {wt}")
     print(f"branch     {st['branch']}   base {st['base'][:10]}")
     print(f"session    {session_id}")
-    print(f"resume     cd {shlex.quote(wt)} && opencode -s {session_id}")
+    print(f"resume     cd {shlex.quote(wt)} && {'codex resume' if codex else 'opencode -s'} {session_id}")
     print(f"exit       {rc}{'  (TIMED OUT after %d min)' % timeout_min if timed_out else ''}")
     print(f"model      {model}")
-    print(f"served by  {', '.join(sorted(served)) if served else 'UNKNOWN (session export failed)'}")
+    print(f"served by  {', '.join(sorted(served)) if served else 'UNKNOWN (no session record found)'}")
+    if codex:
+        print(f"sandbox    {', '.join(sorted(sandboxes)) if sandboxes else 'UNKNOWN (no session record found)'}"
+              f"{'   <-- NOT ' + CODEX_SANDBOX if unsandboxed else ''}")
     print(f"ran in     {ran_in or 'UNKNOWN'}{'   <-- NOT THE WORKTREE' if misplaced else ''}")
     print(f"rounds     {n}/{MAX_ROUNDS}")
     print(f"changed    {'yes' if head_after != head_before else 'NO CHANGES this round'}"
@@ -497,7 +668,7 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     print(stat or "(empty)")
     print(f"\nfull diff:  git -C {shlex.quote(wt)} diff {st['base'][:10]}..HEAD")
     if errors:
-        print("\n-- errors reported by OpenCode --")
+        print(f"\n-- reported by {RUNNER_NAME[w['runner']]} --")
         print("\n".join(errors[:5]))
     tail = errlog.read_text().strip()
     if rc != 0 and tail:
@@ -517,6 +688,9 @@ def worker_round(st, body, kind, timeout_min, fix=False):
                    + ("the session ran outside the task worktree. " if misplaced else "")
                    + ("The main checkout changed during the round (HEAD or working tree). " if escaped else "")
                    + "Inspect the main checkout before doing anything else, and tell the user.")
+    if unsandboxed:
+        raise Fail(f"SANDBOX MISMATCH: a turn of this session ran with sandbox {unsandboxed}, not "
+                   f"{CODEX_SANDBOX}. Inspect the main checkout before doing anything else, and tell the user.")
     if wrong:
         raise Fail(f"MODEL MISMATCH: this session was also served by {wrong}. Expected only "
                    f"{' or '.join(sorted({model_of(w), model_of(w, fix=True)}))}. "
@@ -525,7 +699,8 @@ def worker_round(st, body, kind, timeout_min, fix=False):
         raise Fail("worker timed out. Its partial work is committed on the task branch; inspect it, "
                    "then either `delegate fix` with a narrower instruction or report to the user.")
     if rc != 0:
-        raise Fail(f"opencode exited {rc}. No fallback model is used. If the provider is down, stop and tell the user.")
+        raise Fail(f"{w['runner']} exited {rc}. No fallback model is used. If the provider is down, stop and "
+                   "tell the user.")
 
 
 # ---------------------------------------------------------------- a round typed by a Claude subagent
@@ -542,7 +717,8 @@ def open_round(st, body, kind):
             "reassess the design, find the underlying blocker, and report to the user."
         )
     brief, report = d / f"round-{n}.brief.md", d / f"round-{n}.report.md"
-    brief.write_text(f"{WORKER_CONTRACT}\n---\n# {kind} (round {n}, task {st['task']})\n\n{body.strip()}\n")
+    contract = WORKER_CONTRACT.replace("@GIT_RULE@", GIT_RULE["opencode"])   # a subagent may commit
+    brief.write_text(f"{contract}\n---\n# {kind} (round {n}, task {st['task']})\n\n{body.strip()}\n")
     st.update(open_round=dict(
         n=n, kind=kind, at=now(), head=git(["rev-parse", "HEAD"], st["worktree"]).stdout.strip(),
         main=[git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout]),
@@ -634,7 +810,7 @@ def transcript_usage(path, start, end):
     content block with the same usage, so count each message id once."""
     seen = {}
     try:
-        with open(path) as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 try:
                     o = json.loads(line)
@@ -713,7 +889,7 @@ def read_written(u):
 
 def cmd_check(a):
     if a.typist == "opus":
-        print("typist opus is a Claude Code subagent: there is nothing to check in OpenCode.")
+        print("typist opus is a Claude Code subagent: there is no worker CLI to check.")
         return
     preflight(a.typist, verbose=True)
     print("preflight passed")
@@ -778,7 +954,7 @@ def cmd_start(a):
         print(f"seeded {len(tests['files'])} acceptance test file(s) at {tests['commit'][:10]}; "
               "`delegate verify` refuses if they change.\n")
     if a.check and not worker:
-        print("note: --check is for the OpenCode workers and is ignored for the opus typist.\n")
+        print("note: --check is for the workers and is ignored for the opus typist.\n")
     if dirty:
         print("note: the main checkout has uncommitted changes; the worker starts from the commit "
               f"{base[:10]} and will NOT see them.\n")
@@ -1098,8 +1274,12 @@ def cmd_stats(a):
                 f"{len(v)}, taken over {sum(r['takeover'] for r in rs)}, "
                 f"average rounds {sum(r['rounds'] for r in rs) / len(rs):.1f}")
         costs = [r["cost"] for r in rs if r["cost"] is not None]
+        used = [read_written(r["seats"].get("typist")) for r in rs]
         if costs:
             line += f", cost as OpenCode reports it ${sum(costs):.2f} (${sum(costs) / len(costs):.2f} a task)"
+        elif WORKERS.get(typist, {}).get("runner") == "codex" and any(sum(u) for u in used):
+            line += (f", tokens read / written {tokens(sum(u[0] for u in used))} / "
+                     f"{tokens(sum(u[1] for u in used))} (Codex reports tokens, not cost)")
         failed = sum(r["sc_failed"] for r in rs)
         if failed:
             line += (f", self-check failed first in {failed} round(s) and the worker recovered in "
@@ -1125,8 +1305,8 @@ def cmd_stats(a):
     print(f"{'share of all tokens':62} " + " ".join(
         f"{100 * sum(read_written(total.get(s))) / grand:>16.0f}%" for s in SEATS))
     print("Claude tokens are read from the session transcripts: from the session's start (or the previous\n"
-          "task's last delegate command) to this task's last delegate command. An OpenCode typist's\n"
-          "tokens (deepseek, sol) are OpenCode's own total for the task's session.")
+          "task's last delegate command) to this task's last delegate command. A worker's tokens\n"
+          "(sol, deepseek) are its own CLI's total for the task's session.")
 
 
 def cmd_status(a):
@@ -1196,7 +1376,7 @@ def main():
     s = sub.add_parser("start")
     s.add_argument("task"); s.add_argument("--spec", required=True)
     s.add_argument("--typist", choices=TYPISTS, default=DEFAULT_TYPIST,
-                   help="deepseek, sol: that OpenCode worker runs the round now. "
+                   help="sol (through Codex), deepseek (through OpenCode): that worker runs the round now. "
                         "opus: open a round for the opus-typist subagent; close it with `delegate round`. "
                         f"Default: {DEFAULT_TYPIST}, from $ENG_ORCH_TYPIST")
     s.add_argument("--tests", help="directory of acceptance tests at repository-relative paths; "

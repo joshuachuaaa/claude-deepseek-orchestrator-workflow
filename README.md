@@ -7,14 +7,14 @@ in the seat it is best at:
 |---|---|---|---|
 | Driver | the main Claude Code session | Opus 5.5, xhigh effort | explores, writes the acceptance tests, reviews, verifies, takes over when needed, reports |
 | Judge | `fable-architect` and `fable-signoff` subagents | Fable 5.2, high effort | designs risky or unclear changes, signs off the finished change, answers one consult |
-| Typist | `eng-implementer-sol` or `eng-implementer` agent in [OpenCode](https://opencode.ai) | GPT-6.2 Sol by default, or DeepSeek V4.1 Flash | types the code from a written brief, in its own git worktree |
+| Typist | the Codex CLI (`codex exec`), or the `eng-implementer` agent in [OpenCode](https://opencode.ai) | GPT-6.2 Sol by default, or DeepSeek V4.1 Flash | types the code from a written brief, in its own git worktree |
 
 Two helpers keep the driver's context small: the built-in Explore subagent does
 the searching, and a `test-runner` subagent (Haiku 5.5) runs the gate and returns
 a short result.
 
-A Claude-only version of the same pipeline, with an Opus typist instead of an
-OpenCode worker, is in
+A Claude-only version of the same pipeline, with an Opus typist instead of a
+Codex or OpenCode worker, is in
 [claude-orchestrator-workflow](https://github.com/joshuachuaaa/claude-orchestrator-workflow).
 
 ## The idea
@@ -132,13 +132,14 @@ sequenceDiagram
 | `agents/fable-signoff.md` | Fable subagent: final sign-off |
 | `agents/test-runner.md` | Haiku subagent: runs the gate, returns a short result |
 | `opencode/agents/eng-implementer.md` | the OpenCode worker agent for DeepSeek, with hard denies for pushes, deploys, secrets and anything outside its worktree |
-| `opencode/agents/eng-implementer-sol.md` | the same agent for GPT-6.2 Sol; the two permission lists are kept identical |
 
 ## The two workers
 
 | | `sol` (default) | `deepseek` |
 |---|---|---|
-| Model in OpenCode | `openai/gpt-6.2-sol` | `lithosai/deepseek-ai/DeepSeek-V4.1-Flash` |
+| Runs through | the Codex CLI (`codex exec`) | OpenCode (`opencode run`) |
+| Model | `gpt-6.2-sol` | `lithosai/deepseek-ai/DeepSeek-V4.1-Flash` |
+| Limits | Codex's `workspace-write` sandbox | the agent file's permission list |
 | Effort, implementation round | high | max |
 | Effort, correction round (`delegate fix`) | xhigh | max |
 | Brief | exact contracts and files to read; internals left to the worker | spells out the internal structure |
@@ -162,8 +163,29 @@ than twice the cost. The correction round, where the worker has already failed
 once, is the place for xhigh. A later stage of a staged plan
 (`delegate fix --stage`) is new work and runs at high.
 
-If you sign in to OpenAI in OpenCode with a ChatGPT plan instead of an API key,
-Sol rounds draw on that plan's Codex limits and not on API credit.
+Sol runs under whatever `codex login` is signed in with. Signed in with a
+ChatGPT plan, its rounds draw on that plan's Codex limits and not on API
+credit. `delegate check` prints which it is.
+
+### How Sol is driven
+
+There is no chat to steer. For each task `delegate` starts one Codex session
+and keeps its id:
+
+- The first turn is `codex exec --json -m gpt-6.2-sol -c
+  model_reasoning_effort="high" -s workspace-write -C <worktree>`, with the
+  brief on standard input.
+- Every later turn (a self-check failure, a correction, a later stage) is
+  `codex exec resume <session id>` with the effort for that turn, so the worker
+  keeps its context. Changing the effort on a resumed turn keeps the prompt
+  cache; that was measured, on GPT-6.1 Sol.
+- The sandbox confines the worker's writes to its worktree and the temp
+  directory and gives its commands no network. It cannot commit, because the
+  repository's git directory is outside the worktree; the script commits what
+  it leaves. A test command that needs the network will not run for it.
+- After the round the script reads the session file Codex keeps and prints the
+  model, effort, sandbox and directory of every turn. A turn on another model,
+  outside the sandbox or outside the worktree fails the round.
 
 ### The self-check
 
@@ -184,18 +206,25 @@ command leaves behind are removed, so they never reach the diff.
 ## Requirements
 
 - Claude Code with access to Opus 5.5, Fable 5.2 and Haiku 5.5
-- OpenCode with OpenAI signed in for GPT-6.2 Sol (the default typist), or with
-  a provider that serves DeepSeek V4.1 Flash, or both
+- The [Codex CLI](https://github.com/openai/codex), signed in (`codex login`),
+  for GPT-6.2 Sol, the default typist
+- OpenCode with a provider that serves DeepSeek V4.1 Flash, only if you use the
+  DeepSeek worker
 - git and Python 3
 
-Each worker's model is named in two places: the `model:` line of its agent file
-under `opencode/agents/`, and its entry in the `WORKERS` table at the top of
-`delegate`. The DeepSeek entry uses the OpenCode provider id `lithosai`, and the
-Sol entry uses `openai` with the effort variants `high` and `xhigh`. Run
-`opencode models` to see the ids on your machine, and change both places if
-yours differ. To try another model in the Sol seat (GPT-6.1 Sol, say), change
-the same two places. There is no fallback model on purpose: if a round was
-served by anything else, `delegate` fails loudly.
+Sol's model is the `sol` entry of the `WORKERS` table at the top of `delegate`.
+`ENG_ORCH_SOL_MODEL` puts another Codex model in that seat without editing the
+file (`ENG_ORCH_SOL_MODEL=gpt-6.1-sol`, say). `delegate check` reads Codex's own
+model catalog and refuses, listing what is offered, if the model or one of its
+two efforts is missing; an older Codex CLI may need `codex update` first.
+
+DeepSeek's model is named in two places: the `model:` line of its agent file
+under `opencode/agents/`, and its entry in the same table, which uses the
+OpenCode provider id `lithosai`. Run `opencode models` to see the ids on your
+machine, and change both places if yours differ.
+
+There is no fallback model on purpose: if a round ran on anything else,
+`delegate` fails loudly.
 
 ## Install
 
@@ -207,8 +236,8 @@ git clone https://github.com/joshuachuaaa/claude-deepseek-orchestrator-workflow.
 cd claude-deepseek-orchestrator-workflow && ./install.sh
 ```
 
-The installer copies the skill and subagents into `~/.claude`, the two worker
-agents into `~/.config/opencode/agents`, and links `delegate` into
+The installer copies the skill and subagents into `~/.claude`, the DeepSeek
+worker's agent into `~/.config/opencode/agents`, and links `delegate` into
 `~/.local/bin`. It leaves any existing file that differs alone unless you pass
 `--force`.
 
@@ -261,9 +290,9 @@ Two marker files in a repository's root switch seats off:
 ## Commands
 
 ```
-delegate check [--typist deepseek|sol]    preflight: which worker, opencode, model, agent, credentials
+delegate check [--typist sol|deepseek]    preflight: which worker, its CLI, model, sandbox or agent, sign-in
 delegate prep <task>                      task folder and dossier template
-delegate start <task> --spec FILE --tests DIR --check CMD [--typist deepseek|sol] [--plan FILE] [--signoff]
+delegate start <task> --spec FILE --tests DIR --check CMD [--typist sol|deepseek] [--plan FILE] [--signoff]
 delegate fix <task> --feedback FILE       one correction round
 delegate fix <task> --feedback FILE --stage [--check CMD]   the next stage of a staged plan
 delegate takeover <task> --reason TEXT    the driver takes the task over
@@ -285,22 +314,25 @@ Task records live in `~/.local/state/eng-orch` and worktrees in
 time, how many the driver took over, how often sign-off returned CHANGES, and
 the tokens each seat read and wrote. Its `by typist` section gives, for each
 worker, the first-pass rate, the takeovers, the average rounds, the cost as
-OpenCode reports it, and how often the self-check failed and the worker
+OpenCode reports it (for Sol, the tokens Codex reports), and how often the self-check failed and the worker
 recovered. Those numbers show whether the typist is paying for itself. A fresh
 Claude Code session per task keeps the token counts clean.
 
 ## Status
 
 This is new. The script has been exercised end to end against scratch
-repositories with a stand-in worker, but there are no measurements from real
+repositories with stand-in workers, but there are no measurements from real
 tasks yet, so no claim is made here about cost or quality against a single
-model. That includes the Sol worker, the effort ladder and the self-check: they
-have run against the stand-in only, not against GPT-6.2 Sol in OpenCode, and
-the OpenCode ids for Sol (`openai/gpt-6.2-sol`, variants `high` and `xhigh`) are
-the expected ones, not confirmed ones. Sol is the default typist, so run
-`delegate check` before the first task: it will tell you if they are wrong.
-Until they are right, `ENG_ORCH_TYPIST=deepseek` keeps the DeepSeek worker in
-use.
+model.
+
+The Codex path has also run for real, once: a two-round task (implementation at
+high, a correction at xhigh, the self-check and the gate) with codex-cli 0.160.1
+and GPT-6.1 Sol, on Windows. It has not run with GPT-6.2 Sol: that CLI version's
+catalog did not list it, so `gpt-6.2-sol` is the expected id, not a confirmed
+one. It has not run for real on Linux or macOS either, where Codex's sandbox is
+a different implementation. Run `delegate check` before the first task: it says
+whether the model is there and names what Codex offers. Until it is,
+`ENG_ORCH_SOL_MODEL=gpt-6.1-sol` keeps the Sol seat working.
 
 ## License
 
