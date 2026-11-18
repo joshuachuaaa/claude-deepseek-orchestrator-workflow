@@ -5,6 +5,7 @@
 #     Codex CLI and needs no agent file)
 #   - `delegate` onto your PATH
 # A file that already exists and differs is left alone unless you pass --force.
+# Runs on Linux and macOS, and on Windows from Git Bash.
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -40,7 +41,33 @@ put "$here/opencode/agents/eng-implementer.md" "$opencode/agents/eng-implementer
 target=$claude/$skill/scripts/delegate
 chmod +x "$target"
 mkdir -p "$bin"
-if [ -e "$bin/delegate" ] || [ -L "$bin/delegate" ]; then
+
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) windows=yes ;;
+    *) windows=no ;;
+esac
+
+if [ "$windows" = yes ]; then
+    # Git Bash has no real symlinks and usually no `python3`, so `delegate` is a
+    # small launcher that runs the installed script with a Python that works.
+    py=
+    for cand in python3 python; do
+        if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import sys" >/dev/null 2>&1; then
+            py=$cand
+            break
+        fi
+    done
+    if [ -z "$py" ]; then
+        echo "error: no working python3 or python on PATH" >&2
+        exit 1
+    fi
+    launcher=$(mktemp)
+    printf '#!/bin/sh\n# Written by install.sh: runs the installed delegate script.\nexec %s "%s" "$@"\n' \
+        "$py" "$target" > "$launcher"
+    chmod +x "$launcher"
+    put "$launcher" "$bin/delegate"
+    rm -f "$launcher"
+elif [ -e "$bin/delegate" ] || [ -L "$bin/delegate" ]; then
     if [ "$force" = no ] && [ "$(readlink "$bin/delegate" 2>/dev/null || true)" != "$target" ]; then
         echo "kept       $bin/delegate (already there; pass --force to point it here)"
     else

@@ -52,7 +52,7 @@ A Claude-only version of the same pipeline, with an Opus typist, is in
 ### 1. What you need
 
 - Claude Code with access to Opus 5.5, Fable 5.2 and Haiku 5.5
-- git and Python 3, on Linux or macOS
+- git and Python 3, on Linux, macOS, or Windows with Git Bash
 - The CLI for the typist you will use. You do not need both.
   - `sol-codex`: the Codex CLI, signed in with `codex login`
   - `deepseek-opencode`: OpenCode, with a provider that serves DeepSeek V4.1
@@ -73,7 +73,8 @@ DeepSeek worker's agent file into `~/.config/opencode/agents`, and links the
 `delegate` command into `~/.local/bin`. If a file is already there and differs,
 it is left alone unless you pass `--force`.
 
-Make sure `~/.local/bin` is on your `PATH`.
+Make sure `~/.local/bin` is on your `PATH`. On Windows, run the installer from
+Git Bash; `delegate` is installed there as a small launcher instead of a link.
 
 ### 3. Check your typist
 
@@ -317,7 +318,7 @@ and the typist keeps its context.
   on standard input.
 - **Later turns.** `codex exec resume <session id>`, at the effort for that
   turn. Changing the effort on a resumed turn keeps the prompt cache; that was
-  measured, on GPT-6.1 Sol.
+  measured.
 - **The sandbox.** The typist can write only inside its worktree and the temp
   directory, and its commands have no network. It cannot commit, so the script
   commits what it leaves. A test command that needs the network will not run
@@ -449,23 +450,23 @@ What has been tested:
 
 - The script has run end to end against scratch repositories with stand-ins for
   both CLIs.
-- The `sol-codex` path has also run for real, once: a two-round task (a first
-  attempt at high, a correction at xhigh, the self-check and the gate) with
-  codex-cli 0.160.1 and GPT-6.1 Sol, on Windows.
+- The `sol-codex` path has run for real on GPT-6.2 Sol: a small two-round task
+  (a first attempt at high, a correction at xhigh, the self-check and the gate)
+  with codex-cli 0.170.0 and a ChatGPT-plan sign-in, on Windows from Git Bash.
 
 What has not:
 
-- **GPT-6.2 Sol itself.** With codex-cli 0.160.1 and a ChatGPT-plan sign-in,
-  Codex did not list the model and the server refused it ("not supported when
-  using Codex with a ChatGPT account"). So `gpt-6.2-sol` is the expected id, not
-  a confirmed one.
+- **Real-size tasks.** The real runs were a few lines of code in a scratch
+  repository.
 - **Linux and macOS, for real.** Codex's sandbox is a different implementation
   there.
 - **`deepseek-opencode`, for real.** It has only run against the stand-in.
 
 If `delegate check` says Codex does not offer GPT-6.2 Sol:
 
-1. Update the Codex CLI. This is OpenAI's own guidance.
+1. Update the Codex CLI. codex-cli 0.160.1 did not offer the model, and the
+   server refused it ("not supported when using Codex with a ChatGPT account");
+   0.170.0 offers it.
 
    ```bash
    codex update

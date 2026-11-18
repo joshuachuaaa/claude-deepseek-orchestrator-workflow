@@ -255,6 +255,17 @@ def save_state(st):
 
 def pid_alive(pid):
     """Portable liveness check (no /proc, so it also works on macOS)."""
+    if os.name == "nt":
+        # os.kill(pid, 0) is not a probe on Windows: 0 is CTRL_C_EVENT, and it would be sent.
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() == 5        # access denied: it exists
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+        k32.CloseHandle(handle)
+        return bool(ok) and code.value == 259          # STILL_ACTIVE
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
