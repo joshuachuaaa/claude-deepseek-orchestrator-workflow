@@ -327,12 +327,18 @@ model.
 
 The Codex path has also run for real, once: a two-round task (implementation at
 high, a correction at xhigh, the self-check and the gate) with codex-cli 0.160.1
-and GPT-6.1 Sol, on Windows. It has not run with GPT-6.2 Sol: that CLI version's
-catalog did not list it, so `gpt-6.2-sol` is the expected id, not a confirmed
-one. It has not run for real on Linux or macOS either, where Codex's sandbox is
-a different implementation. Run `delegate check` before the first task: it says
-whether the model is there and names what Codex offers. Until it is,
-`ENG_ORCH_SOL_MODEL=gpt-6.1-sol` keeps the Sol seat working.
+and GPT-6.1 Sol, on Windows. It has not run with GPT-6.2 Sol, the default: that
+CLI version's catalog did not list it, and with a ChatGPT-plan sign-in the
+server refused it ("not supported when using Codex with a ChatGPT account"). So
+`gpt-6.2-sol` is the expected id, not a confirmed one. OpenAI's guidance is to
+update the Codex CLI (`codex update`); after that, whether the model appears
+depends on your plan and on the rollout. It has not run for real on Linux or
+macOS either, where Codex's sandbox is a different implementation.
+
+Run `delegate check` before the first task: it says whether Codex offers the
+model and names what it does offer. The script never substitutes another model
+by itself. If you choose to, `ENG_ORCH_SOL_MODEL=gpt-6.1-sol` puts GPT-6.1 Sol
+in the seat until 6.2 is there.
 
 ## License
 
