@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """delegate - bridge between Claude Code (Opus reviewer, Fable architect) and the typist.
 
-Three typists. Two are workers this script runs itself (see WORKERS below). `sol` is
+Three typists. Two are workers this script runs itself (see WORKERS below), and they are
+interchangeable: same brief, same gate, chosen by name. `sol-codex` is
 GPT-6.2 Sol through the Codex CLI (`codex exec`, in the workspace-write sandbox), at high
-effort for an implementation round and xhigh for a correction round. `deepseek` is the
+effort for an implementation round and xhigh for a correction round. `deepseek-opencode` is the
 OpenCode agent `eng-implementer` on lithosai/deepseek-ai/DeepSeek-V4.1-Flash#max. There is
 no fallback model: if a worker's model cannot be reached, or a round turns out to have
 been run with anything else, this script fails loudly. With `start --typist opus` the
 typist is a Claude Code subagent (`opus-typist`) that the driver calls itself: `start` and
 `fix` then only open a round, and `delegate round` closes it. The default typist is
-$ENG_ORCH_TYPIST, or sol.
+$ENG_ORCH_TYPIST, or sol-codex.
 
 With `start --check CMD` the script runs CMD itself when a worker says it has finished,
 and sends a failure straight back into the worker's session (once per round) before the
@@ -19,9 +20,10 @@ Everything the orchestrator reviews is produced here (diff, commit, test exit co
 not taken from the typist's own report.
 
 Commands (run from inside the project's git repository):
-  delegate check [--typist sol|deepseek]
+  delegate check [--typist sol-codex|deepseek-opencode]
   delegate prep <task>                      planning folder + dossier template
-  delegate start <task> --spec FILE [--typist sol|deepseek|opus] [--tests DIR] [--check CMD]
+  delegate start <task> --spec FILE [--typist sol-codex|deepseek-opencode|opus]
+                        [--tests DIR] [--check CMD]
                         [--plan FILE] [--signoff] [--base REF] [--timeout MIN]
   delegate fix <task> --feedback FILE [--stage] [--check CMD] [--timeout MIN]
   delegate round <task>                     close a round typed by the opus-typist subagent
@@ -49,8 +51,9 @@ import sys
 import time
 from pathlib import Path
 
-# The workers. `runner` is the CLI that drives the model: `sol` goes through the Codex CLI
-# (`codex exec`), `deepseek` through OpenCode (`opencode run`). `variant` is the reasoning
+# The workers, named model-runner. `runner` is the CLI that drives the model: `sol-codex`
+# goes through the Codex CLI (`codex exec`), `deepseek-opencode` through OpenCode
+# (`opencode run`). `variant` is the reasoning
 # effort for an implementation round and `fix_variant` the one for a correction round.
 # The Codex worker needs no agent file: its limits are the sandbox named on the command
 # line, and $ENG_ORCH_SOL_MODEL puts another Codex model in the seat. The OpenCode worker's
@@ -58,9 +61,9 @@ from pathlib import Path
 # two disagree; `credential` is the text looked for in `opencode auth list`.
 SOL_MODEL = os.environ.get("ENG_ORCH_SOL_MODEL", "gpt-6.2-sol")
 WORKERS = {
-    "sol": dict(label="GPT-6.2 Sol" if SOL_MODEL == "gpt-6.2-sol" else SOL_MODEL, runner="codex",
+    "sol-codex": dict(label="GPT-6.2 Sol" if SOL_MODEL == "gpt-6.2-sol" else SOL_MODEL, runner="codex",
                 provider="openai", model_id=SOL_MODEL, variant="high", fix_variant="xhigh"),
-    "deepseek": dict(label="DeepSeek V4.1 Flash", runner="opencode", provider="lithosai",
+    "deepseek-opencode": dict(label="DeepSeek V4.1 Flash", runner="opencode", provider="lithosai",
                      model_id="deepseek-ai/DeepSeek-V4.1-Flash", variant="max", fix_variant="max",
                      agent="eng-implementer", credential="lithos"),
 }
@@ -75,8 +78,17 @@ def codex_exe():
 # commands no network. The repository's git directory is outside the worktree, so the worker
 # cannot commit; the script commits for it.
 CODEX_SANDBOX = "workspace-write"
+# The short names older commands and task records used.
+ALIASES = {"sol": "sol-codex", "deepseek": "deepseek-opencode"}
+
+
+def typist_name(name):
+    """A typist's full name, whichever way it was written."""
+    return ALIASES.get(name, name)
+
+
 TYPISTS = (*WORKERS, "opus")
-DEFAULT_TYPIST = os.environ.get("ENG_ORCH_TYPIST", "sol")
+DEFAULT_TYPIST = typist_name(os.environ.get("ENG_ORCH_TYPIST", "sol-codex"))
 OPT_OUT_MARKER = ".no-delegate"
 
 # The self-check (`start --check CMD`): how many times a failure is sent back to the worker
@@ -581,7 +593,7 @@ def self_check(st, n, k):
 def worker_round(st, body, kind, timeout_min, fix=False):
     d = Path(st["state_dir"])
     wt = st["worktree"]
-    w = WORKERS[st.get("typist", "deepseek")]
+    w = WORKERS[typist_name(st.get("typist", "deepseek"))]
     model = model_of(w, fix)
     n = st["rounds"] + 1
     if n > MAX_ROUNDS:
@@ -987,7 +999,7 @@ def cmd_fix(a):
         if not a.check.strip():
             raise Fail("--check needs a command, e.g. --check 'pytest -q tests/test_x.py'")
         st["selfcheck"] = a.check.strip()
-    preflight(st.get("typist", "deepseek"))
+    preflight(typist_name(st.get("typist", "deepseek")))
     with Lock(Path(st["state_dir"])):
         worker_round(st, fb, kind, a.timeout, fix=not a.stage)
 
@@ -1232,7 +1244,7 @@ def cmd_stats(a):
         add_usage(seats, "typist", st.get("worker_usage"))
         checks = [h["selfcheck"] for h in st.get("history", []) if h.get("selfcheck")]
         rows.append(dict(repo=f.parent.parent.name, task=st["task"], designer=st.get("designer", "opus"),
-                         typist=st.get("typist", "deepseek"), seats=seats,
+                         typist=typist_name(st.get("typist", "deepseek")), seats=seats,
                          cost=(st.get("worker_usage") or {}).get("cost"),
                          sc_failed=sum(not c[0]["passed"] for c in checks),
                          sc_recovered=sum(len(c) > 1 and c[-1]["passed"] for c in checks),
@@ -1270,7 +1282,7 @@ def cmd_stats(a):
         by.setdefault(r["typist"], []).append(r)
     for typist, rs in sorted(by.items()):
         v = [r for r in rs if r["first"] is not None]
-        line = (f"  {typist:9} tasks {len(rs)}, passed the first verification {sum(r['first'] for r in v)} of "
+        line = (f"  {typist:18} tasks {len(rs)}, passed the first verification {sum(r['first'] for r in v)} of "
                 f"{len(v)}, taken over {sum(r['takeover'] for r in rs)}, "
                 f"average rounds {sum(r['rounds'] for r in rs) / len(rs):.1f}")
         costs = [r["cost"] for r in rs if r["cost"] is not None]
@@ -1290,23 +1302,23 @@ def cmd_stats(a):
     def cell(u):
         return f"{' / '.join(tokens(n) for n in read_written(u)) if sum(read_written(u)) else '-':>17}"
 
-    print(f"{'repo':28} {'task':24} {'typed by':8} " + " ".join(f"{s:>17}" for s in SEATS))
+    print(f"{'repo':28} {'task':24} {'typed by':17} " + " ".join(f"{s:>17}" for s in SEATS))
     total = {}
     for r in rows:
         for s in SEATS:
             add_usage(total, s, r["seats"].get(s))
-        print(f"{r['repo'][:28]:28} {r['task'][:24]:24} {r['typist']:8} "
+        print(f"{r['repo'][:28]:28} {r['task'][:24]:24} {r['typist']:17} "
               + " ".join(cell(r["seats"].get(s)) for s in SEATS))
     grand = sum(sum(read_written(u)) for u in total.values())
     if not grand:
         print("no token usage recorded yet (it is collected from tasks run after 15 Nov 2026)")
         return
-    print(f"{'all tasks':62} " + " ".join(cell(total.get(s)) for s in SEATS))
-    print(f"{'share of all tokens':62} " + " ".join(
+    print(f"{'all tasks':71} " + " ".join(cell(total.get(s)) for s in SEATS))
+    print(f"{'share of all tokens':71} " + " ".join(
         f"{100 * sum(read_written(total.get(s))) / grand:>16.0f}%" for s in SEATS))
     print("Claude tokens are read from the session transcripts: from the session's start (or the previous\n"
           "task's last delegate command) to this task's last delegate command. A worker's tokens\n"
-          "(sol, deepseek) are its own CLI's total for the task's session.")
+          "(sol-codex, deepseek-opencode) are its own CLI's total for the task's session.")
 
 
 def cmd_status(a):
@@ -1337,7 +1349,7 @@ def cmd_status(a):
             sgate = "stale"
         else:
             sgate = so["verdict"]
-        print(f"{t}: designer {st.get('designer', 'opus')}, typist {st.get('typist', 'deepseek')}, "
+        print(f"{t}: designer {st.get('designer', 'opus')}, typist {typist_name(st.get('typist', 'deepseek'))}, "
               f"rounds {st['rounds']}/{MAX_ROUNDS}"
               f"{' (round %d open)' % st['open_round']['n'] if st.get('open_round') else ''}"
               f"{' (taken over by the driver)' if st.get('takeover') else ''}, "
@@ -1369,14 +1381,15 @@ def main():
               file=sys.stderr)
         sys.exit(2)
     s = sub.add_parser("check")
-    s.add_argument("--typist", choices=TYPISTS, default=DEFAULT_TYPIST,
+    s.add_argument("--typist", type=typist_name, choices=TYPISTS, default=DEFAULT_TYPIST,
                    help=f"which typist to check (default: {DEFAULT_TYPIST}, from $ENG_ORCH_TYPIST)")
     s.set_defaults(fn=cmd_check)
     s = sub.add_parser("prep"); s.add_argument("task"); s.set_defaults(fn=cmd_prep)
     s = sub.add_parser("start")
     s.add_argument("task"); s.add_argument("--spec", required=True)
-    s.add_argument("--typist", choices=TYPISTS, default=DEFAULT_TYPIST,
-                   help="sol (through Codex), deepseek (through OpenCode): that worker runs the round now. "
+    s.add_argument("--typist", type=typist_name, choices=TYPISTS, default=DEFAULT_TYPIST,
+                   help="sol-codex (GPT-6.2 Sol through Codex) or deepseek-opencode (DeepSeek through "
+                        "OpenCode): that worker runs the round now. "
                         "opus: open a round for the opus-typist subagent; close it with `delegate round`. "
                         f"Default: {DEFAULT_TYPIST}, from $ENG_ORCH_TYPIST")
     s.add_argument("--tests", help="directory of acceptance tests at repository-relative paths; "

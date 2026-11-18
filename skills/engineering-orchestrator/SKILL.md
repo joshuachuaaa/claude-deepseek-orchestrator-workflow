@@ -1,7 +1,8 @@
 ---
 name: engineering-orchestrator
 disable-model-invocation: true
-description: Plan, build, review and accept a substantial coding task with Opus 5.5 as the working session, Fable 5.2 as architect and final sign-off (subagents), and a worker (GPT-6.2 Sol through the Codex CLI, or DeepSeek V4.1 Flash through OpenCode) for large machine-checkable implementation. Use for implementation work in a git repository that is a new feature, module or endpoint, a refactor across several files, or roughly 150+ lines of new code. Do not use for questions, explanations, reviews of existing code, config changes, or fixes whose cause is already known.
+argument-hint: "[sol-codex | deepseek-opencode] <task>"
+description: Plan, build, review and accept a substantial coding task with Opus 5.5 as the working session, Fable 5.2 as architect and final sign-off (subagents), and one of two interchangeable workers (sol-codex: GPT-6.2 Sol through the Codex CLI; deepseek-opencode: DeepSeek V4.1 Flash through OpenCode) for large machine-checkable implementation. Use for implementation work in a git repository that is a new feature, module or endpoint, a refactor across several files, or roughly 150+ lines of new code. Do not use for questions, explanations, reviews of existing code, config changes, or fixes whose cause is already known.
 ---
 
 # Engineering orchestrator
@@ -20,13 +21,29 @@ description: Plan, build, review and accept a substantial coding task with Opus 
 - **test-runner (subagent, Haiku).** Runs `delegate verify` and returns a short
   result.
 - **Worker: a model that `delegate` runs through its own CLI.** Types the code
-  from a brief, in its own git worktree. There are two: GPT-6.2 Sol through the
-  Codex CLI (`sol`, the default), at high effort for an implementation round and
-  xhigh for a correction round, and DeepSeek V4.1 Flash through OpenCode at max
-  effort (`deepseek`). You never talk to a worker: you write a file and run
-  `delegate`. The user chooses which worker; you never do. It is the one the user names in the request, otherwise the default
-  that `delegate check` prints (Sol, unless `ENG_ORCH_TYPIST` says otherwise).
-  Pass `--typist` to `delegate start` only when the user named one.
+  from a brief, in its own git worktree. You never talk to a worker: you write
+  a file and run `delegate`. There are two, and they are interchangeable: the
+  same brief, the same gate, the same commands.
+  - `sol-codex`: GPT-6.2 Sol through the Codex CLI, at high effort for an
+    implementation round and xhigh for a correction round. The default.
+  - `deepseek-opencode`: DeepSeek V4.1 Flash through OpenCode, at max effort.
+
+## Which worker
+
+The user chooses the worker; you never do.
+
+- If the request starts with `sol-codex` or `deepseek-opencode`, that word is
+  the worker and the rest is the task. A worker named anywhere else in the
+  request ("use deepseek-opencode for this") counts the same way.
+- Otherwise the worker is the default: `sol-codex`, unless `ENG_ORCH_TYPIST`
+  names the other.
+
+Before triage, run `delegate check --typist <worker>` (plain `delegate check`
+for the default). It prints the worker and stops if that worker's CLI, model
+or sign-in is not ready. If it stops, tell the user what it said; do not switch
+to the other worker yourself. Pass the same `--typist <worker>` to
+`delegate start`. Later commands for the task (`fix`, `verify` and the rest)
+take no such flag: the task remembers its worker.
 
 Fable is never the main model and never the `/advisor`: both would make it read
 the whole conversation. It only ever reads a dossier, a sign-off package or a
@@ -48,8 +65,8 @@ machine can check.
 ## Step 0. Triage: four decisions
 
 Make all four before doing anything else and state them in one line to the user,
-for example: `Triage: design=fable, typist=worker (sol), pieces=1, signoff=yes`.
-Run `delegate check` first to learn which worker is the default.
+for example: `Triage: design=fable, typist=worker (sol-codex), pieces=1, signoff=yes`.
+Name the worker from "Which worker" above in that line.
 
 **A. Is this a task for this skill at all?** No, do it directly without the skill,
 if it is a question, explanation, review, config change, or a fix whose cause is
@@ -161,7 +178,7 @@ worker never sees them.
 
 **Worker types:**
 
-    delegate start <task> --spec <dir>/brief.md --tests <dir>/tests --check '<acceptance test command>' [--plan <dir>/plan.md] [--signoff]
+    delegate start <task> [--typist <worker>] --spec <dir>/brief.md --tests <dir>/tests --check '<acceptance test command>' [--plan <dir>/plan.md] [--signoff]
 
 `--tests` commits the acceptance tests into the worktree before the worker
 starts, and `delegate verify` refuses if they change afterwards. `--check` is
@@ -349,7 +366,7 @@ task keeps the numbers clean.
 
 ## Commands
 
-    delegate check [--typist sol|deepseek]   preflight: which worker, its CLI, model, sandbox or agent, sign-in
+    delegate check [--typist sol-codex|deepseek-opencode]   preflight: which worker, its CLI, model, sandbox or agent, sign-in
     delegate takeover <task> --reason "..."   you take the task over from the worker
     delegate status [<task>]       rounds, verification, sign-off, session
     delegate stats                 every task so far: rounds, first-pass rate, takeovers, CHANGES rate, tokens by seat

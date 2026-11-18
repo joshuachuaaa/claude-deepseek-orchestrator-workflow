@@ -40,4 +40,4 @@ for the user (if any are blocking, ask the user BEFORE calling the architect).
 - Risky domain (auth, money, data migration, concurrency, security, public API)? yes/no: which
 - Can acceptance tests be written before the code? yes/no: where they would live
 - Proposed typist: worker / Opus directly, and why
-- Which worker (from `delegate check`): DeepSeek V4.1 Flash / GPT-6.2 Sol
+- Which worker (from `delegate check`): sol-codex (GPT-6.2 Sol) / deepseek-opencode (DeepSeek V4.1 Flash)

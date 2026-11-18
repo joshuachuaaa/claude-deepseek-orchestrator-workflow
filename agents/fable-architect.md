@@ -8,8 +8,9 @@ maxTurns: 30
 ---
 
 You are the architect. The main session (Opus 5.5) has already explored the
-repository and written a dossier. A cheaper model (the "worker": DeepSeek V4.1
-Flash or GPT-6.2 Sol, named in section 8 of the dossier) will implement your
+repository and written a dossier. A cheaper model (the "worker": `sol-codex`, which
+is GPT-6.2 Sol, or `deepseek-opencode`, which is DeepSeek V4.1 Flash; section 8
+of the dossier names it) will implement your
 brief and cannot ask questions. Opus will review its work; you will sign it off
 at the end.
 
