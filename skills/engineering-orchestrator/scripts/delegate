@@ -3,8 +3,8 @@
 
 Three typists. Two are workers this script runs itself (see WORKERS below), and they are
 interchangeable: same brief, same gate, chosen by name. `sol-codex` is
-GPT-6.2 Sol through the Codex CLI (`codex exec`, in the workspace-write sandbox), at high
-effort for an implementation round and xhigh for a correction round. `deepseek-opencode` is the
+GPT-6.2 Sol through the Codex CLI (`codex exec`, in the workspace-write sandbox), at xhigh
+effort for every round. `deepseek-opencode` is the
 OpenCode agent `eng-implementer` on lithosai/deepseek-ai/DeepSeek-V4.1-Flash#max. There is
 no fallback model: if a worker's model cannot be reached, or a round turns out to have
 been run with anything else, this script fails loudly. With `start --typist opus` the
@@ -15,6 +15,9 @@ $ENG_ORCH_TYPIST, or sol-codex.
 With `start --check CMD` the script runs CMD itself when a worker says it has finished,
 and sends a failure straight back into the worker's session (once per round) before the
 driver is involved.
+
+As soon as a worker's session has started, the script prints a `resume` line: the command
+that opens that session (`codex resume` or `opencode -s`), so the user can follow the round.
 
 Everything the orchestrator reviews is produced here (diff, commit, test exit code),
 not taken from the typist's own report.
@@ -62,7 +65,7 @@ from pathlib import Path
 SOL_MODEL = os.environ.get("ENG_ORCH_SOL_MODEL", "gpt-6.2-sol")
 WORKERS = {
     "sol-codex": dict(label="GPT-6.2 Sol" if SOL_MODEL == "gpt-6.2-sol" else SOL_MODEL, runner="codex",
-                provider="openai", model_id=SOL_MODEL, variant="high", fix_variant="xhigh"),
+                provider="openai", model_id=SOL_MODEL, variant="xhigh", fix_variant="xhigh"),
     "deepseek-opencode": dict(label="DeepSeek V4.1 Flash", runner="opencode", provider="lithosai",
                      model_id="deepseek-ai/DeepSeek-V4.1-Flash", variant="max", fix_variant="max",
                      agent="eng-implementer", credential="lithos"),
@@ -456,17 +459,73 @@ def opencode_record(session_id, cwd):
 
 # ---------------------------------------------------------------- one worker round
 
-def worker_turn(st, w, model, message, stem, timeout_s):
+def worker_turn(st, w, model, message, stem, timeout_s, announce=True):
     """One turn of the worker in the task's session, through its runner.
     Returns (exit code, timed out, the worker's last message, errors the runner reported, stderr log)."""
     turn = codex_turn if w["runner"] == "codex" else opencode_turn
-    return turn(st, w, model, message, stem, timeout_s)
+    return turn(st, w, model, message, stem, timeout_s, announce)
 
 
-def codex_turn(st, w, model, message, stem, timeout_s):
-    """One `codex exec` in the task's session. The message goes in on stdin."""
+def resume_line(st, w):
+    """The command that opens the worker's session, so the user can follow it."""
+    opener = "codex resume" if w["runner"] == "codex" else "opencode -s"
+    return f"cd {shlex.quote(st['worktree'])} && {opener} {st['session_id']}"
+
+
+def first_session_id(events, w):
+    """The session id, from the first event that carries it (or None while there is none yet)."""
+    try:
+        lines = events.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if w["runner"] == "codex" and ev.get("type") == "thread.started" and ev.get("thread_id"):
+            return ev["thread_id"]
+        if w["runner"] == "opencode" and ev.get("sessionID"):
+            return ev["sessionID"]
+    return None
+
+
+def run_turn(st, w, cmd, stdin_file, events, errlog, timeout_s, announce):
+    """Run the runner's command with its events going to a file. As soon as the session id is known
+    (at once when the task already has one, otherwise from the first event that carries it), save it
+    and print the `resume` line, flushed, so the user can follow the round while it runs.
+    Returns (exit code, timed out)."""
+    wt = st["worktree"]
+    shown = False
+    if announce and st.get("session_id"):
+        print(f"resume     {resume_line(st, w)}", flush=True)
+        shown = True
+    deadline = time.monotonic() + timeout_s
+    with open(events, "w") as out, open(errlog, "w") as err, open(stdin_file or os.devnull, "rb") as inp:
+        p = subprocess.Popen(cmd, cwd=wt, env=env_in(wt), stdin=inp, stdout=out, stderr=err)
+        while True:
+            try:
+                return p.wait(timeout=2), False
+            except subprocess.TimeoutExpired:
+                pass
+            if announce and not shown:
+                sid = st.get("session_id") or first_session_id(events, w)
+                if sid:
+                    st["session_id"] = sid
+                    save_state(st)   # the session id must survive a crash, or the next round starts a new session
+                    print(f"resume     {resume_line(st, w)}", flush=True)
+                    shown = True
+            if time.monotonic() >= deadline:
+                p.kill()
+                p.wait()
+                return 124, True
+
+
+def codex_turn(st, w, model, message, stem, timeout_s, announce=True):
+    """One `codex exec` in the task's session. The message goes in on stdin, from a file kept
+    next to the round's other records."""
     d, wt = Path(st["state_dir"]), st["worktree"]
-    events, errlog = d / f"{stem}.events.jsonl", d / f"{stem}.stderr.log"
+    events, errlog, prompt = d / f"{stem}.events.jsonl", d / f"{stem}.stderr.log", d / f"{stem}.prompt.md"
     effort = model.rsplit("#", 1)[1]
     opts = ["--json", "-m", w["model_id"], "-c", f'model_reasoning_effort="{effort}"']
     if st.get("session_id"):
@@ -474,13 +533,8 @@ def codex_turn(st, w, model, message, stem, timeout_s):
         cmd = [codex_exe(), "exec", "resume", st["session_id"], *opts, "-c", f'sandbox_mode="{CODEX_SANDBOX}"', "-"]
     else:
         cmd = [codex_exe(), "exec", *opts, "-s", CODEX_SANDBOX, "-C", wt, "-"]
-    timed_out = False
-    with open(events, "w") as out, open(errlog, "w") as err:
-        try:
-            rc = subprocess.run(cmd, cwd=wt, env=env_in(wt), input=message.encode(), stdout=out, stderr=err,
-                                timeout=timeout_s).returncode
-        except subprocess.TimeoutExpired:
-            timed_out, rc = True, 124
+    prompt.write_text(message, encoding="utf-8")
+    rc, timed_out = run_turn(st, w, cmd, prompt, events, errlog, timeout_s, announce)
     report, errors, usage, finished = "", [], None, False
     for line in events.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -511,7 +565,7 @@ def codex_turn(st, w, model, message, stem, timeout_s):
     return rc, timed_out, report.strip(), errors, errlog
 
 
-def opencode_turn(st, w, model, message, stem, timeout_s):
+def opencode_turn(st, w, model, message, stem, timeout_s, announce=True):
     """One `opencode run` in the task's session."""
     d, wt = Path(st["state_dir"]), st["worktree"]
     events, errlog = d / f"{stem}.events.jsonl", d / f"{stem}.stderr.log"
@@ -520,13 +574,7 @@ def opencode_turn(st, w, model, message, stem, timeout_s):
     if st.get("session_id"):
         cmd += ["--session", st["session_id"]]
     cmd.append(message)
-    timed_out = False
-    with open(events, "w") as out, open(errlog, "w") as err:
-        try:
-            rc = subprocess.run(cmd, cwd=wt, env=env_in(wt), stdout=out, stderr=err,
-                                timeout=timeout_s).returncode
-        except subprocess.TimeoutExpired:
-            timed_out, rc = True, 124
+    rc, timed_out = run_turn(st, w, cmd, None, events, errlog, timeout_s, announce)
     texts, last_msg, errors = {}, None, []
     for line in events.read_text().splitlines():
         try:
@@ -621,6 +669,7 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     head_before = git(["rev-parse", "HEAD"], wt).stdout.strip()
     main_before = (git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout)
     deadline = time.monotonic() + timeout_min * 60
+    print(f"== worker round {n} ({kind}) for task '{st['task']}' is running on {model} ==", flush=True)
     rc, timed_out, report, errors, errlog = worker_turn(st, w, model, brief, f"round-{n}", timeout_min * 60)
     # Capture whatever the worker left behind, so the diff is complete and reviewable.
     committed = capture(st, f"worker round {n}")
@@ -636,7 +685,8 @@ def worker_round(st, body, kind, timeout_min, fix=False):
         left = deadline - time.monotonic()
         if passed or k > SELFCHECK_RETRIES or left < 120:
             break
-        rc, timed_out, again, more, errlog = worker_turn(st, w, model, feedback, f"round-{n}.selfcheck-{k}", left)
+        rc, timed_out, again, more, errlog = worker_turn(st, w, model, feedback, f"round-{n}.selfcheck-{k}", left,
+                                                         announce=False)   # same session, already printed
         report, errors = again or report, errors + [e for e in more if e not in errors]
         committed = capture(st, f"worker round {n}, after self-check {k}") or committed
     (d / f"round-{n}.report.md").write_text(report + "\n")

@@ -93,7 +93,7 @@ A passing check looks like this:
 ```
 ok  typist        sol-codex (GPT-6.2 Sol)
 ok  codex         codex-cli <version>
-ok  model         openai/gpt-6.2-sol#high   corrections: openai/gpt-6.2-sol#xhigh
+ok  model         openai/gpt-6.2-sol#xhigh
 ok  sandbox       workspace-write (writes stay in the worktree; no network)
 ok  sign-in       Logged in using ChatGPT
 preflight passed
@@ -165,7 +165,7 @@ How the two differ:
 
 | | `sol-codex` | `deepseek-opencode` |
 |---|---|---|
-| Effort for the first attempt | high | max |
+| Effort for the first attempt | xhigh | max |
 | Effort for a correction | xhigh | max |
 | What the brief contains | exact contracts and the files to read; the internals are left to the typist | the internal structure as well |
 | Worth using from | about 100 changed lines | about 200 changed lines |
@@ -178,9 +178,10 @@ the expensive seat, and a stronger typist is expected to take work off it: fewer
 corrections, fewer takeovers, shorter briefs. That is an expectation, not a
 measurement. [Measure it](#measuring-whether-it-pays-off) on your own tasks.
 
-Why high and not xhigh for Sol's first attempt: launch-week measurements put
-xhigh about one index point above high, for more than twice the cost. xhigh is
-kept for the correction, where the typist has already failed once.
+Sol runs at xhigh for every round. Launch-week measurements put xhigh about one
+index point above high, for more than twice the cost. For a cheaper first
+attempt, set `variant` back to `high` in the `sol-codex` entry of the `WORKERS`
+table at the top of `delegate`; corrections stay at xhigh.
 
 ## What happens during a task
 
@@ -314,7 +315,7 @@ and the typist keeps its context.
 ### `sol-codex`
 
 - **First turn.** `codex exec --json -m gpt-6.2-sol -c
-  model_reasoning_effort="high" -s workspace-write -C <worktree>`, with the brief
+  model_reasoning_effort="xhigh" -s workspace-write -C <worktree>`, with the brief
   on standard input.
 - **Later turns.** `codex exec resume <session id>`, at the effort for that
   turn. Changing the effort on a resumed turn keeps the prompt cache; that was
@@ -336,6 +337,20 @@ and the typist keeps its context.
   publishing, network fetches, secrets and anything outside the worktree.
 - **The record.** After each round the script asks OpenCode which model
   answered and where the session ran, and fails the round on a mismatch.
+
+### Following a round
+
+As soon as the typist's session has started, usually within a minute, the
+script prints a `resume` line, and prints it again in the round's summary:
+
+```
+resume     cd <worktree> && codex resume <session id>
+```
+
+For `deepseek-opencode` it is `cd <worktree> && opencode -s <session id>`. The
+driver passes the line on to you; open it in a terminal to watch the typist
+work. Only watch. A message typed there runs outside the script, and a turn on
+another model or sandbox fails the next round's record check.
 
 ### The self-check
 

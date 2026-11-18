@@ -24,8 +24,8 @@ description: Plan, build, review and accept a substantial coding task with Opus 
   from a brief, in its own git worktree. You never talk to a worker: you write
   a file and run `delegate`. There are two, and they are interchangeable: the
   same brief, the same gate, the same commands.
-  - `sol-codex`: GPT-6.2 Sol through the Codex CLI, at high effort for an
-    implementation round and xhigh for a correction round. The default.
+  - `sol-codex`: GPT-6.2 Sol through the Codex CLI, at xhigh effort for every
+    round. The default.
   - `deepseek-opencode`: DeepSeek V4.1 Flash through OpenCode, at max effort.
 
 ## Which worker
@@ -191,7 +191,12 @@ round and costs you nothing; always pass it. Pass `--plan`
 when Fable designed (this makes sign-off mandatory). Pass `--signoff` when you
 designed but the change is risky. Run it with the Bash tool's
 `run_in_background` and wait for it to finish; do not poll more than every few
-minutes. After it starts, give the user the `resume` command it prints.
+minutes. The one exception: as soon as the worker's session starts (usually
+within a minute) the script prints a `resume` line, `cd <worktree> && codex
+resume <id>` for Sol or `cd <worktree> && opencode -s <id>` for DeepSeek. Read
+the background output once, about a minute after starting, and give that line
+to the user so they can open the session and follow the round. The same line
+prints at the start of every `delegate fix` round.
 
 Sol runs in Codex's sandbox: it can write only inside its worktree, its
 commands have no network, and it cannot commit (the script commits what it
