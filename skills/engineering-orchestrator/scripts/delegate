@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """delegate - bridge between Claude Code (Opus reviewer, Fable architect) and the typist.
 
-Two typists. The default is the OpenCode worker: agent `eng-implementer` on
-lithosai/deepseek-ai/DeepSeek-V4.1-Flash#max. There is no fallback model: if that
-model cannot be reached, or a round turns out to have been served by anything else,
-this script fails loudly. With `start --typist opus` the typist is a Claude Code
-subagent (`opus-typist`) that the driver calls itself: `start` and `fix` then only
-open a round, and `delegate round` closes it.
+Three typists. Two are OpenCode workers (see WORKERS below): `deepseek`, agent
+`eng-implementer` on lithosai/deepseek-ai/DeepSeek-V4.1-Flash#max, and `sol`, agent
+`eng-implementer-sol` on openai/gpt-6.2-sol, at high effort for an implementation round
+and xhigh for a correction round. There is no fallback model: if a worker's model cannot
+be reached, or a round turns out to have been served by anything else, this script fails
+loudly. With `start --typist opus` the typist is a Claude Code subagent (`opus-typist`)
+that the driver calls itself: `start` and `fix` then only open a round, and
+`delegate round` closes it. The default typist is $ENG_ORCH_TYPIST, or deepseek.
+
+With `start --check CMD` the script runs CMD itself when a worker says it has finished,
+and sends a failure straight back into the worker's session (once per round) before the
+driver is involved.
 
 Everything the orchestrator reviews is produced here (diff, commit, test exit code),
 not taken from the typist's own report.
 
 Commands (run from inside the project's git repository):
-  delegate check
+  delegate check [--typist deepseek|sol]
   delegate prep <task>                      planning folder + dossier template
-  delegate start <task> --spec FILE [--typist deepseek|opus] [--tests DIR] [--plan FILE] [--signoff]
-                        [--base REF] [--timeout MIN]
-  delegate fix <task> --feedback FILE [--timeout MIN]
+  delegate start <task> --spec FILE [--typist deepseek|sol|opus] [--tests DIR] [--check CMD]
+                        [--plan FILE] [--signoff] [--base REF] [--timeout MIN]
+  delegate fix <task> --feedback FILE [--stage] [--check CMD] [--timeout MIN]
   delegate round <task>                     close a round typed by the opus-typist subagent
   delegate takeover <task> --reason TEXT    the driver takes the task over from the typist
   delegate verify <task> [--allow-test-changes] [--timeout MIN] -- <test command...>
@@ -39,14 +45,30 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-PROVIDER = "lithosai"
-MODEL_ID = "deepseek-ai/DeepSeek-V4.1-Flash"
-VARIANT = "max"
-MODEL = f"{PROVIDER}/{MODEL_ID}#{VARIANT}"
-AGENT = "eng-implementer"
+# The OpenCode workers. `variant` is the reasoning effort for an implementation round and
+# `fix_variant` the one for a correction round. Each worker's model is also named in the
+# `model:` line of its agent file, and `check` refuses if the two disagree. `credential`
+# is the text looked for in `opencode auth list`.
+WORKERS = {
+    "deepseek": dict(label="DeepSeek V4.1 Flash", provider="lithosai",
+                     model_id="deepseek-ai/DeepSeek-V4.1-Flash", variant="max", fix_variant="max",
+                     agent="eng-implementer", credential="lithos"),
+    "sol": dict(label="GPT-6.2 Sol", provider="openai",
+                model_id="gpt-6.2-sol", variant="high", fix_variant="xhigh",
+                agent="eng-implementer-sol", credential="openai"),
+}
+TYPISTS = (*WORKERS, "opus")
+DEFAULT_TYPIST = os.environ.get("ENG_ORCH_TYPIST", "deepseek")
 OPT_OUT_MARKER = ".no-delegate"
+
+# The self-check (`start --check CMD`): how many times a failure is sent back to the worker
+# within one round, how long one run of CMD may take, and how much of its output the worker sees.
+SELFCHECK_RETRIES = int(os.environ.get("ENG_ORCH_SELFCHECK_RETRIES", "1"))
+SELFCHECK_TIMEOUT_MIN = int(os.environ.get("ENG_ORCH_SELFCHECK_TIMEOUT_MIN", "15"))
+SELFCHECK_TAIL_CHARS = 6000
 
 # Claude Code subagent types, by the seat their tokens are counted under in `stats`.
 JUDGE_AGENTS = {"fable-architect", "fable-signoff", "fable-judge"}
@@ -233,32 +255,41 @@ class Lock:
 
 # ---------------------------------------------------------------- preflight
 
-def preflight(verbose=False):
+def model_of(w, fix=False):
+    return f"{w['provider']}/{w['model_id']}#{w['fix_variant'] if fix else w['variant']}"
+
+
+def preflight(typist, verbose=False):
+    w = WORKERS[typist]
+    name, agent = f"{w['provider']}/{w['model_id']}", w["agent"]
     if not shutil.which("opencode"):
         raise Fail("opencode is not on PATH.")
     models = run(["opencode", "models"], timeout=120).stdout.split()
-    if f"{PROVIDER}/{MODEL_ID}" not in models:
+    if name not in models:
         raise Fail(
-            f"model {PROVIDER}/{MODEL_ID} is not offered by OpenCode on this machine.\n"
-            "No substitute will be used. Fix the LithosAI provider in ~/.config/opencode/opencode.json."
+            f"model {name} is not offered by OpenCode on this machine.\n"
+            f"No substitute will be used. Fix the {w['provider']} provider in ~/.config/opencode/opencode.json."
         )
     agents = json.loads(run(["opencode", "debug", "agents"], timeout=120).stdout)
-    a = next((x for x in agents if x.get("id") == AGENT), None)
+    a = next((x for x in agents if x.get("id") == agent), None)
     if not a:
-        raise Fail(f"OpenCode agent '{AGENT}' is missing (~/.config/opencode/agents/{AGENT}.md).")
+        raise Fail(f"OpenCode agent '{agent}' is missing (~/.config/opencode/agents/{agent}.md).")
     m = a.get("model") or {}
-    if (m.get("providerID"), m.get("id"), m.get("variant")) != (PROVIDER, MODEL_ID, VARIANT):
-        raise Fail(f"agent '{AGENT}' is configured for {m}, expected {MODEL}.")
+    if (m.get("providerID"), m.get("id"), m.get("variant")) != (w["provider"], w["model_id"], w["variant"]):
+        raise Fail(f"agent '{agent}' is configured for {m}, expected {model_of(w)}.")
     if verbose:
         ver = run(["opencode", "--version"]).stdout.strip()
+        print(f"ok  typist        {typist} ({w['label']})")
         print(f"ok  opencode      {ver}")
-        print(f"ok  model         {MODEL}")
-        print(f"ok  agent         {AGENT} ({len(a.get('permissions', []))} permission rules)")
+        print(f"ok  model         {model_of(w)}"
+              + (f"   corrections: {model_of(w, fix=True)}" if w["fix_variant"] != w["variant"] else ""))
+        print(f"ok  agent         {agent} ({len(a.get('permissions', []))} permission rules)")
         auth = run(["opencode", "auth", "list"], check=False, timeout=60).stdout
-        has = any("lithos" in line.lower() for line in auth.splitlines())
-        print(f"{'ok ' if has else 'NO '} credentials   LithosAI {'stored' if has else 'NOT FOUND (opencode auth login)'}")
+        has = any(w["credential"] in line.lower() for line in auth.splitlines())
+        print(f"{'ok ' if has else 'NO '} credentials   {w['provider']} "
+              f"{'stored' if has else 'NOT FOUND (opencode auth login)'}")
         if not has:
-            raise Fail("no LithosAI credential in OpenCode.")
+            raise Fail(f"no {w['provider']} credential in OpenCode.")
 
 
 def session_record(session_id, cwd):
@@ -291,9 +322,102 @@ def session_record(session_id, cwd):
 
 # ---------------------------------------------------------------- one worker round
 
-def worker_round(st, body, kind, timeout_min):
+def opencode_turn(st, w, model, message, stem, timeout_s):
+    """One `opencode run` in the task's session.
+    Returns (exit code, timed out, the worker's last message, errors OpenCode reported, stderr log)."""
+    d, wt = Path(st["state_dir"]), st["worktree"]
+    events, errlog = d / f"{stem}.events.jsonl", d / f"{stem}.stderr.log"
+    cmd = ["opencode", "run", "--agent", w["agent"], "-m", model, "--auto", "--format", "json",
+           "--title", f"eng-orch:{st['task']}"]
+    if st.get("session_id"):
+        cmd += ["--session", st["session_id"]]
+    cmd.append(message)
+    timed_out = False
+    with open(events, "w") as out, open(errlog, "w") as err:
+        try:
+            rc = subprocess.run(cmd, cwd=wt, env=env_in(wt), stdout=out, stderr=err,
+                                timeout=timeout_s).returncode
+        except subprocess.TimeoutExpired:
+            timed_out, rc = True, 124
+    texts, last_msg, errors = {}, None, []
+    for line in events.read_text().splitlines():
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        st["session_id"] = st.get("session_id") or ev.get("sessionID")
+        part = ev.get("part") or {}
+        if ev.get("type") == "text" and part.get("text"):
+            last_msg = part.get("messageID")
+            texts.setdefault(last_msg, []).append(part["text"])
+        if ev.get("type") == "error":
+            errors.append(json.dumps(ev.get("error") or ev)[:600])
+    st["updated"] = now()
+    save_state(st)   # the session id must survive a crash, or the next round starts a new session
+    return rc, timed_out, "\n".join(texts.get(last_msg, [])).strip(), errors, errlog
+
+
+def capture(st, label):
+    """Commit whatever is uncommitted in the worktree, so the diff is complete and reviewable."""
+    wt = st["worktree"]
+    if not git(["status", "--porcelain"], wt).stdout.strip():
+        return False
+    git(["add", "-A"], wt)
+    git([*ident(wt), "commit", "-q", "--no-verify", "-m", f"eng-orch({st['task']}): {label}"], wt)
+    return True
+
+
+def changed_tests(st):
+    """Seeded acceptance tests that no longer match what the driver committed."""
+    seeded = st.get("tests")
+    if not seeded:
+        return []
+    return git(["diff", "--name-only", seeded["commit"], "HEAD", "--", *seeded["files"]],
+               st["worktree"]).stdout.splitlines()
+
+
+def self_check(st, n, k):
+    """Run the task's check command on the committed worktree.
+    Returns (passed, exit code, what to tell the worker when it failed)."""
+    d, wt = Path(st["state_dir"]), st["worktree"]
+    log = d / f"round-{n}.selfcheck-{k}.log"
+    timed_out = False
+    with open(log, "w") as out:
+        try:
+            rc = subprocess.run(st["selfcheck"], shell=True, cwd=wt, env=env_in(wt), stdout=out,
+                                stderr=subprocess.STDOUT, timeout=SELFCHECK_TIMEOUT_MIN * 60).returncode
+        except subprocess.TimeoutExpired:
+            timed_out, rc = True, 124
+    # The check ran on a fully committed tree, so anything it left behind is its own debris.
+    # Remove it, or the next commit would sweep it into the diff.
+    if git(["status", "--porcelain"], wt).stdout.strip():
+        git(["reset", "-q", "--hard"], wt)
+        git(["clean", "-fdq"], wt)
+    changed = changed_tests(st)
+    if rc == 0 and not changed:
+        return True, rc, None
+    parts = [f"# SELF-CHECK FAILED (round {n}, task {st['task']})", "",
+             "After you finished, the script ran the acceptance command on your committed work and it "
+             "did not pass. The work is not done.", "",
+             f"Command: {st['selfcheck']}",
+             f"Exit: {rc}{' (timed out after %d min)' % SELFCHECK_TIMEOUT_MIN if timed_out else ''}"]
+    if changed:
+        parts += ["", "These acceptance tests were changed. They must be exactly as they were seeded; restore "
+                      f"each one with `git show {st['tests']['commit'][:10]}:<path> > <path>`:",
+                  *(f"- {p}" for p in changed)]
+    tail = log.read_text(errors="replace")[-SELFCHECK_TAIL_CHARS:].strip()
+    parts += ["", "Output (tail):", "```", tail or "(no output)", "```", "",
+              "Find the cause, fix the implementation, and run the command yourself until it passes. Do not "
+              "change, skip or delete the acceptance tests. If the command cannot pass because the brief or "
+              "a test is wrong, stop and say so under Blockers. Finish with the same REPORT as before."]
+    return False, rc if rc != 0 else 1, "\n".join(parts) + "\n"
+
+
+def worker_round(st, body, kind, timeout_min, fix=False):
     d = Path(st["state_dir"])
     wt = st["worktree"]
+    w = WORKERS[st.get("typist", "deepseek")]
+    model = model_of(w, fix)
     n = st["rounds"] + 1
     if n > MAX_ROUNDS:
         raise Fail(
@@ -304,59 +428,45 @@ def worker_round(st, body, kind, timeout_min):
     if len(brief.encode()) > MAX_BRIEF_BYTES:
         raise Fail(f"brief is {len(brief.encode())} bytes; keep it under {MAX_BRIEF_BYTES}. Split the task.")
     (d / f"round-{n}.brief.md").write_text(brief)
-    events = d / f"round-{n}.events.jsonl"
-    errlog = d / f"round-{n}.stderr.log"
-
-    cmd = ["opencode", "run", "--agent", AGENT, "-m", MODEL, "--auto", "--format", "json",
-           "--title", f"eng-orch:{st['task']}"]
-    if st.get("session_id"):
-        cmd += ["--session", st["session_id"]]
-    cmd.append(brief)
 
     head_before = git(["rev-parse", "HEAD"], wt).stdout.strip()
     main_before = (git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout)
-    timed_out = False
-    with open(events, "w") as out, open(errlog, "w") as err:
-        try:
-            rc = subprocess.run(cmd, cwd=wt, env=env_in(wt), stdout=out, stderr=err,
-                                timeout=timeout_min * 60).returncode
-        except subprocess.TimeoutExpired:
-            timed_out, rc = True, 124
-
-    session_id, texts, last_msg, errors = st.get("session_id"), {}, None, []
-    for line in events.read_text().splitlines():
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        session_id = session_id or ev.get("sessionID")
-        part = ev.get("part") or {}
-        if ev.get("type") == "text" and part.get("text"):
-            last_msg = part.get("messageID")
-            texts.setdefault(last_msg, []).append(part["text"])
-        if ev.get("type") == "error":
-            errors.append(json.dumps(ev.get("error") or ev)[:600])
-    report = "\n".join(texts.get(last_msg, [])).strip()
-    (d / f"round-{n}.report.md").write_text(report + "\n")
-
+    deadline = time.monotonic() + timeout_min * 60
+    rc, timed_out, report, errors, errlog = opencode_turn(st, w, model, brief, f"round-{n}", timeout_min * 60)
     # Capture whatever the worker left behind, so the diff is complete and reviewable.
-    committed = False
-    if git(["status", "--porcelain"], wt).stdout.strip():
-        git(["add", "-A"], wt)
-        git([*ident(wt), "commit", "-q", "--no-verify", "-m", f"eng-orch({st['task']}): worker round {n}"], wt)
-        committed = True
+    committed = capture(st, f"worker round {n}")
+
+    # Self-check. A worker that stopped early or broke an acceptance test hears about it here, in its
+    # own session and at cached-input prices, instead of costing the driver a review and a correction
+    # round. It is not a worker round and does not replace `delegate verify`.
+    checks = []
+    while st.get("selfcheck") and rc == 0 and not timed_out:
+        k = len(checks) + 1
+        passed, check_rc, feedback = self_check(st, n, k)
+        checks.append({"exit": check_rc, "passed": passed})
+        left = deadline - time.monotonic()
+        if passed or k > SELFCHECK_RETRIES or left < 120:
+            break
+        rc, timed_out, again, more, errlog = opencode_turn(st, w, model, feedback, f"round-{n}.selfcheck-{k}", left)
+        report, errors = again or report, errors + more
+        committed = capture(st, f"worker round {n}, after self-check {k}") or committed
+    (d / f"round-{n}.report.md").write_text(report + "\n")
     head_after = git(["rev-parse", "HEAD"], wt).stdout.strip()
 
-    st.update(session_id=session_id, rounds=n, updated=now())
-    st.setdefault("history", []).append(
-        {"round": n, "kind": kind, "exit": rc, "timed_out": timed_out, "head": head_after, "at": now()})
+    entry = {"round": n, "kind": kind, "model": model, "exit": rc, "timed_out": timed_out,
+             "head": head_after, "at": now()}
+    if checks:
+        entry["selfcheck"] = checks
+    st.update(rounds=n, updated=now())
+    st.setdefault("history", []).append(entry)
     save_state(st)
 
+    session_id = st.get("session_id")
     served, ran_in, usage = session_record(session_id, wt) if session_id else (None, None, None)
     if usage:
         st["worker_usage"] = usage
         save_state(st)
-    wrong = sorted(served - {MODEL}) if served else []
+    wrong = sorted(served - {model_of(w), model_of(w, fix=True)}) if served else []
     main_after = (git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout)
     escaped = main_after != main_before
     misplaced = ran_in is not None and Path(ran_in).resolve() != Path(wt).resolve()
@@ -367,11 +477,21 @@ def worker_round(st, body, kind, timeout_min):
     print(f"session    {session_id}")
     print(f"resume     cd {shlex.quote(wt)} && opencode -s {session_id}")
     print(f"exit       {rc}{'  (TIMED OUT after %d min)' % timeout_min if timed_out else ''}")
+    print(f"model      {model}")
     print(f"served by  {', '.join(sorted(served)) if served else 'UNKNOWN (session export failed)'}")
     print(f"ran in     {ran_in or 'UNKNOWN'}{'   <-- NOT THE WORKTREE' if misplaced else ''}")
     print(f"rounds     {n}/{MAX_ROUNDS}")
     print(f"changed    {'yes' if head_after != head_before else 'NO CHANGES this round'}"
           f"{' (uncommitted work captured by this script)' if committed else ''}")
+    if checks:
+        last = checks[-1]
+        how = "PASS" if last["passed"] else f"STILL FAILING (exit {last['exit']})"
+        if len(checks) > 1:
+            how += ", after the first run failed and the failure was sent back to the worker"
+        print(f"self-check {how}")
+        print(f"           {st['selfcheck']}   log {d / f'round-{n}.selfcheck-{len(checks)}.log'}")
+    elif st.get("selfcheck"):
+        print("self-check not run (the worker's turn did not finish cleanly)")
     stat = git(["diff", "--stat", f"{st['base']}..HEAD"], wt).stdout.strip()
     print("\n-- diff vs base (measured by this script) --")
     print(stat or "(empty)")
@@ -386,7 +506,11 @@ def worker_round(st, body, kind, timeout_min):
     print("\n-- WORKER REPORT DIGEST (a claim, not evidence; verify it) --")
     print(report_digest(report) if report else "(the worker produced no final report)")
     print(f"full report: {d / f'round-{n}.report.md'}")
-    print(f"\nnext: review the diff, then `delegate verify {st['task']} -- <test command>`")
+    if checks and not checks[-1]["passed"]:
+        print("\nnext: the self-check still fails. Read its log and the diff, then send the one correction "
+              f"(`delegate fix {st['task']}`) or take over.")
+    else:
+        print(f"\nnext: review the diff, then `delegate verify {st['task']} -- <test command>`")
 
     if misplaced or escaped:
         raise Fail("ISOLATION BREACH: "
@@ -394,7 +518,8 @@ def worker_round(st, body, kind, timeout_min):
                    + ("The main checkout changed during the round (HEAD or working tree). " if escaped else "")
                    + "Inspect the main checkout before doing anything else, and tell the user.")
     if wrong:
-        raise Fail(f"MODEL MISMATCH: this session was also served by {wrong}. Expected only {MODEL}. "
+        raise Fail(f"MODEL MISMATCH: this session was also served by {wrong}. Expected only "
+                   f"{' or '.join(sorted({model_of(w), model_of(w, fix=True)}))}. "
                    "Treat this round as invalid and tell the user.")
     if timed_out:
         raise Fail("worker timed out. Its partial work is committed on the task branch; inspect it, "
@@ -587,14 +712,19 @@ def read_written(u):
 # ---------------------------------------------------------------- commands
 
 def cmd_check(a):
-    preflight(verbose=True)
+    if a.typist == "opus":
+        print("typist opus is a Claude Code subagent: there is nothing to check in OpenCode.")
+        return
+    preflight(a.typist, verbose=True)
     print("preflight passed")
 
 
 def cmd_start(a):
     root = repo_root()
     task = task_name(a.task)
-    worker = a.typist == "deepseek"
+    worker = a.typist in WORKERS
+    if a.check is not None and not a.check.strip():
+        raise Fail("--check needs a command, e.g. --check 'pytest -q tests/test_x.py'")
     if worker and (root / OPT_OUT_MARKER).exists():
         raise Fail(f"{root} contains {OPT_OUT_MARKER}: this repository's code must not be sent to the "
                    "worker's provider. Implement directly.")
@@ -609,7 +739,7 @@ def cmd_start(a):
     if (d / "state.json").exists():
         raise Fail(f"task '{task}' already exists. Use `delegate fix {task}` or pick another name.")
     if worker:
-        preflight()
+        preflight(a.typist)
     base = git(["rev-parse", "--verify", f"{a.base}^{{commit}}"], root, check=False)
     if base.returncode != 0:
         raise Fail(f"cannot resolve base '{a.base}'. The repository needs at least one commit.")
@@ -641,11 +771,14 @@ def cmd_start(a):
     st = dict(task=task, repo=str(root), worktree=str(wt), branch=branch, base=base,
               origin_branch=git(["rev-parse", "--abbrev-ref", "HEAD"], root).stdout.strip(),
               state_dir=str(d), session_id=None, rounds=0, created=now(), integrated=False,
-              designer=designer, signoff_required=bool(a.plan or a.signoff), tests=tests, typist=a.typist)
+              designer=designer, signoff_required=bool(a.plan or a.signoff), tests=tests, typist=a.typist,
+              selfcheck=a.check.strip() if a.check and worker else None)
     save_state(st)
     if tests:
         print(f"seeded {len(tests['files'])} acceptance test file(s) at {tests['commit'][:10]}; "
               "`delegate verify` refuses if they change.\n")
+    if a.check and not worker:
+        print("note: --check is for the OpenCode workers and is ignored for the opus typist.\n")
     if dirty:
         print("note: the main checkout has uncommitted changes; the worker starts from the commit "
               f"{base[:10]} and will NOT see them.\n")
@@ -667,13 +800,20 @@ def cmd_fix(a):
     fb = Path(a.feedback).read_text()
     if not fb.strip():
         raise Fail("feedback file is empty.")
+    # A later stage of a staged plan is new work, not a correction: it is labelled as a brief
+    # and runs at the worker's implementation effort.
+    kind = "IMPLEMENTATION BRIEF - next stage" if a.stage else "REVIEW FEEDBACK - corrections required"
     if st.get("typist") == "opus":
         with Lock(Path(st["state_dir"])):
-            open_round(st, fb, "REVIEW FEEDBACK - corrections required")
+            open_round(st, fb, kind)
         return
-    preflight()
+    if a.check is not None:
+        if not a.check.strip():
+            raise Fail("--check needs a command, e.g. --check 'pytest -q tests/test_x.py'")
+        st["selfcheck"] = a.check.strip()
+    preflight(st.get("typist", "deepseek"))
     with Lock(Path(st["state_dir"])):
-        worker_round(st, fb, "REVIEW FEEDBACK - corrections required", a.timeout)
+        worker_round(st, fb, kind, a.timeout, fix=not a.stage)
 
 
 def cmd_takeover(a):
@@ -706,9 +846,7 @@ def cmd_verify(a):
         raise Fail("the worktree has uncommitted changes. Evidence must be tied to a commit: "
                    "commit or discard them in the worktree first.")
     head = git(["rev-parse", "HEAD"], wt).stdout.strip()
-    seeded = st.get("tests")
-    tests_changed = git(["diff", "--name-only", seeded["commit"], "HEAD", "--", *seeded["files"]],
-                        wt).stdout.splitlines() if seeded else []
+    tests_changed = changed_tests(st)
     if tests_changed and not a.allow_test_changes:
         raise Fail("GATE: acceptance tests changed after they were seeded:\n  " + "\n  ".join(tests_changed)
                    + "\nIf the worker changed them, the round failed. If you corrected a wrong test "
@@ -841,8 +979,18 @@ def cmd_package(a):
     holdback = (d / "holdback.md").read_text() if (d / "holdback.md").exists() else None
     reports = sorted(d.glob("round-*.report.md"), key=lambda p: int(p.stem.split(".")[0].split("-")[1]))
     digest = report_digest(reports[-1].read_text()) if reports else "(no worker report)"
+    def checked(h):
+        sc = h.get("selfcheck")
+        if not sc:
+            return ""
+        if not sc[-1]["passed"]:
+            return "; the script's self-check was still failing when the round ended"
+        return ("; the script's self-check failed first and passed after the failure was sent back to the worker"
+                if len(sc) > 1 else "; the script's self-check passed")
+
     rounds = "\n".join(f"- round {h['round']}: {h['kind']}, exit {h['exit']}"
-                       f"{' (timed out)' if h.get('timed_out') else ''}" for h in st.get("history", []))
+                       f"{' (timed out)' if h.get('timed_out') else ''}{checked(h)}"
+                       for h in st.get("history", []))
     if st.get("takeover"):
         rounds += (f"\n- after round {st['takeover']['round']}: the driver (Opus) took the task over from the "
                    f"worker: {st['takeover']['reason']}")
@@ -906,8 +1054,12 @@ def cmd_stats(a):
         sos = [json.loads(p.read_text()) for p in d.glob("signoff-*.json")]
         seats = usage.get(d, {})
         add_usage(seats, "typist", st.get("worker_usage"))
+        checks = [h["selfcheck"] for h in st.get("history", []) if h.get("selfcheck")]
         rows.append(dict(repo=f.parent.parent.name, task=st["task"], designer=st.get("designer", "opus"),
                          typist=st.get("typist", "deepseek"), seats=seats,
+                         cost=(st.get("worker_usage") or {}).get("cost"),
+                         sc_failed=sum(not c[0]["passed"] for c in checks),
+                         sc_recovered=sum(len(c) > 1 and c[-1]["passed"] for c in checks),
                          rounds=st["rounds"], verifies=len(evs), failed=sum(e["exit"] != 0 for e in evs),
                          first=None if not evs else evs[0]["exit"] == 0, takeover=bool(st.get("takeover")),
                          signoffs=len(sos), changes=sum(s["verdict"] == "CHANGES" for s in sos),
@@ -935,6 +1087,25 @@ def cmd_stats(a):
         print(f"architect sign-offs on {len(signed)} tasks; {caught} returned CHANGES at least once "
               f"({100 * caught / len(signed):.0f}%)")
 
+    # The comparison a change of typist is judged by: same gate, different typist.
+    print("\nby typist")
+    by = {}
+    for r in rows:
+        by.setdefault(r["typist"], []).append(r)
+    for typist, rs in sorted(by.items()):
+        v = [r for r in rs if r["first"] is not None]
+        line = (f"  {typist:9} tasks {len(rs)}, passed the first verification {sum(r['first'] for r in v)} of "
+                f"{len(v)}, taken over {sum(r['takeover'] for r in rs)}, "
+                f"average rounds {sum(r['rounds'] for r in rs) / len(rs):.1f}")
+        costs = [r["cost"] for r in rs if r["cost"] is not None]
+        if costs:
+            line += f", cost as OpenCode reports it ${sum(costs):.2f} (${sum(costs) / len(costs):.2f} a task)"
+        failed = sum(r["sc_failed"] for r in rs)
+        if failed:
+            line += (f", self-check failed first in {failed} round(s) and the worker recovered in "
+                     f"{sum(r['sc_recovered'] for r in rs)}")
+        print(line)
+
     print("\ntokens read / written, by seat (read counts each turn's whole context, cached or not)")
     def cell(u):
         return f"{' / '.join(tokens(n) for n in read_written(u)) if sum(read_written(u)) else '-':>17}"
@@ -954,8 +1125,8 @@ def cmd_stats(a):
     print(f"{'share of all tokens':62} " + " ".join(
         f"{100 * sum(read_written(total.get(s))) / grand:>16.0f}%" for s in SEATS))
     print("Claude tokens are read from the session transcripts: from the session's start (or the previous\n"
-          "task's last delegate command) to this task's last delegate command. The DeepSeek typist's\n"
-          "tokens are OpenCode's own total for the task's session.")
+          "task's last delegate command) to this task's last delegate command. An OpenCode typist's\n"
+          "tokens (deepseek, sol) are OpenCode's own total for the task's session.")
 
 
 def cmd_status(a):
@@ -1013,21 +1184,35 @@ def cmd_cleanup(a):
 def main():
     ap = argparse.ArgumentParser(prog="delegate", description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("check").set_defaults(fn=cmd_check)
+    if DEFAULT_TYPIST not in TYPISTS:
+        print(f"\ndelegate: ENG_ORCH_TYPIST is '{DEFAULT_TYPIST}'; it must be one of {', '.join(TYPISTS)}.",
+              file=sys.stderr)
+        sys.exit(2)
+    s = sub.add_parser("check")
+    s.add_argument("--typist", choices=TYPISTS, default=DEFAULT_TYPIST,
+                   help=f"which typist to check (default: {DEFAULT_TYPIST}, from $ENG_ORCH_TYPIST)")
+    s.set_defaults(fn=cmd_check)
     s = sub.add_parser("prep"); s.add_argument("task"); s.set_defaults(fn=cmd_prep)
     s = sub.add_parser("start")
     s.add_argument("task"); s.add_argument("--spec", required=True)
-    s.add_argument("--typist", choices=("deepseek", "opus"), default="deepseek",
-                   help="deepseek: the OpenCode worker runs the round now (default). "
-                        "opus: open a round for the opus-typist subagent; close it with `delegate round`")
+    s.add_argument("--typist", choices=TYPISTS, default=DEFAULT_TYPIST,
+                   help="deepseek, sol: that OpenCode worker runs the round now. "
+                        "opus: open a round for the opus-typist subagent; close it with `delegate round`. "
+                        f"Default: {DEFAULT_TYPIST}, from $ENG_ORCH_TYPIST")
     s.add_argument("--tests", help="directory of acceptance tests at repository-relative paths; "
                                    "committed into the worktree before the worker starts")
+    s.add_argument("--check", metavar="CMD",
+                   help="self-check: a shell command the script runs in the worktree when the worker has "
+                        "finished; a failure goes back into the worker's session once before the round ends")
     s.add_argument("--plan", help="architect's plan; makes sign-off mandatory before integrate")
     s.add_argument("--signoff", action="store_true", help="require architect sign-off (risky change)")
     s.add_argument("--base", default="HEAD"); s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MIN)
     s.set_defaults(fn=cmd_start)
     s = sub.add_parser("fix")
     s.add_argument("task"); s.add_argument("--feedback", required=True)
+    s.add_argument("--stage", action="store_true",
+                   help="the file is the next stage's brief, not a correction: implementation effort")
+    s.add_argument("--check", metavar="CMD", help="replace the task's self-check command from here on")
     s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MIN)
     s.set_defaults(fn=cmd_fix)
     s = sub.add_parser("round"); s.add_argument("task"); s.set_defaults(fn=cmd_round)

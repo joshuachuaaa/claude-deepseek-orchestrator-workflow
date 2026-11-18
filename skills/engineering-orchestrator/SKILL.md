@@ -1,7 +1,7 @@
 ---
 name: engineering-orchestrator
 disable-model-invocation: true
-description: Plan, build, review and accept a substantial coding task with Opus 5.5 as the working session, Fable 5.2 as architect and final sign-off (subagents), and the DeepSeek worker in OpenCode for large mechanical implementation. Use for implementation work in a git repository that is a new feature, module or endpoint, a refactor across several files, or roughly 150+ lines of new code. Do not use for questions, explanations, reviews of existing code, config changes, or fixes whose cause is already known.
+description: Plan, build, review and accept a substantial coding task with Opus 5.5 as the working session, Fable 5.2 as architect and final sign-off (subagents), and a worker in OpenCode (DeepSeek V4.1 Flash or GPT-6.2 Sol) for large machine-checkable implementation. Use for implementation work in a git repository that is a new feature, module or endpoint, a refactor across several files, or roughly 150+ lines of new code. Do not use for questions, explanations, reviews of existing code, config changes, or fixes whose cause is already known.
 ---
 
 # Engineering orchestrator
@@ -19,8 +19,13 @@ description: Plan, build, review and accept a substantial coding task with Opus 
 - **Explore (built-in subagent, Haiku).** All repository searching.
 - **test-runner (subagent, Haiku).** Runs `delegate verify` and returns a short
   result.
-- **Worker: DeepSeek V4.1 Flash (max) in OpenCode via `delegate`.** Types the
-  code from a brief, in its own git worktree.
+- **Worker: an OpenCode agent run by `delegate`.** Types the code from a brief,
+  in its own git worktree. There are two: DeepSeek V4.1 Flash at max effort
+  (`deepseek`), and GPT-6.2 Sol (`sol`) at high effort for an implementation
+  round and xhigh for a correction round. The user chooses which one; you never
+  do. It is the one the user names in the request, otherwise the default that
+  `delegate check` prints (set by `ENG_ORCH_TYPIST`). Pass `--typist` to
+  `delegate start` only when the user named one.
 
 Fable is never the main model and never the `/advisor`: both would make it read
 the whole conversation. It only ever reads a dossier, a sign-off package or a
@@ -42,7 +47,8 @@ machine can check.
 ## Step 0. Triage: four decisions
 
 Make all four before doing anything else and state them in one line to the user,
-for example: `Triage: design=fable, typist=worker, pieces=1, signoff=yes`.
+for example: `Triage: design=fable, typist=worker (sol), pieces=1, signoff=yes`.
+Run `delegate check` first to learn which worker is the default.
 
 **A. Is this a task for this skill at all?** No, do it directly without the skill,
 if it is a question, explanation, review, config change, or a fix whose cause is
@@ -59,8 +65,12 @@ Otherwise you design. If the repository root contains `.no-fable`, you design
 regardless and say so.
 
 **C. Who types?** The worker, if all of these hold:
-1. Roughly 200+ lines of new or changed code, or many similar edits across files.
-2. The design can be stated exactly (names, signatures, contracts).
+1. Many similar edits across files, or enough new or changed code: roughly 200+
+   lines for DeepSeek, roughly 100+ for Sol.
+2. The design can be stated exactly. For DeepSeek that means names, signatures,
+   contracts and the internal structure. For Sol the contracts must be exact
+   (names, signatures, behaviour at the boundaries); the internals need not be
+   designed in advance.
 3. The result is machine-checkable: you can write acceptance tests for it before
    any code exists.
 4. The brief will be much shorter than the work it replaces. If specifying the
@@ -122,6 +132,13 @@ Design, Conventions, Tests with exact command, numbered Acceptance criteria, Out
 scope, Stop conditions) and `holdback.md` (two to five checks the worker will not
 see) in the task directory.
 
+How much the Design section spells out depends on the worker. DeepSeek
+implements the brief literally: give it the internal structure as well as the
+contracts. Sol needs the contracts exact and the files to read first; leave the
+internal structure to it and keep the brief short, because every line you write
+for it costs more than the line it writes. For either worker, name every file
+it needs to read. Discovery is your job, not the worker's.
+
 ## Step 3c. Write the acceptance tests first
 
 Before any code is written, write the acceptance tests yourself: the cases the
@@ -142,10 +159,16 @@ worker never sees them.
 
 **Worker types:**
 
-    delegate start <task> --spec <dir>/brief.md --tests <dir>/tests [--plan <dir>/plan.md] [--signoff]
+    delegate start <task> --spec <dir>/brief.md --tests <dir>/tests --check '<acceptance test command>' [--plan <dir>/plan.md] [--signoff]
 
 `--tests` commits the acceptance tests into the worktree before the worker
-starts, and `delegate verify` refuses if they change afterwards. Pass `--plan`
+starts, and `delegate verify` refuses if they change afterwards. `--check` is
+the self-check: one shell command that runs the acceptance tests (the command
+from section 5 of the brief, limited to those test files so it is quick). When
+the worker says it has finished, the script runs it in the worktree, and if it
+fails or an acceptance test was changed, the script sends the output back into
+the worker's own session once before the round ends. That is not a correction
+round and costs you nothing; always pass it. Pass `--plan`
 when Fable designed (this makes sign-off mandatory). Pass `--signoff` when you
 designed but the change is risky. Run it with the Bash tool's
 `run_in_background` and wait for it to finish; do not poll more than every few
@@ -154,8 +177,11 @@ minutes. After it starts, give the user the `resume` command it prints.
 For several pieces (decision D), start each as its own task in the background at
 the same time, then take each through Steps 5 to 7 on its own.
 
-For a staged plan, dispatch stage 1 only. Later stages go in as `delegate fix`
-rounds with that stage's brief, each verified before the next.
+For a staged plan, dispatch stage 1 only. Later stages go in as
+`delegate fix <task> --feedback <that stage's brief> --stage`, each verified
+before the next. `--stage` marks the round as new work, so it runs at the
+worker's implementation effort, not its correction effort. Add
+`--check '<command>'` when the stage has its own acceptance tests.
 
 **You type:** implement in the main checkout following brief.md exactly, then
 verify with the test command. If sign-off is required, write the package yourself
@@ -163,6 +189,11 @@ to `<dir>/signoff-package-1.md` with the same sections `delegate package` uses:
 plan, held-back checks, what you ran and its result, the full `git diff`.
 
 ## Step 5. Review and verify (worker path)
+
+Read the `self-check` line the round printed. `PASS` means the acceptance tests
+pass on the committed work; it does not replace anything below. `STILL FAILING`
+means the worker was already told once and could not fix it: do not run
+`delegate verify`, read the self-check log and the diff, and go to Step 6.
 
 1. Read the diff stat the round printed. Read in full the files the plan marks as
    risky and any file whose change you did not expect. For the rest, read enough
@@ -198,7 +229,9 @@ The worker gets one correction per stage. After that you do the work.
 
        delegate fix <task> --feedback <dir>/feedback-<n>.md
 
-   Review and verify again from Step 5.
+   Review and verify again from Step 5. With Sol the script runs this round at
+   xhigh effort by itself. The self-check's automatic retry inside a round does
+   not use up this correction.
 2. **Take over.** If the gate or your review still fails after that round, do not
    send a third. Record it and finish the task yourself:
 
@@ -265,14 +298,16 @@ Commit only if the user asked for commits. Then `delegate cleanup <task>`.
 Lead with the decision: accepted, accepted with noted risks, or not accepted and
 why. Then: triage line; what changed (from the diff); design decisions and allowed
 deviations; commands run and real results, including failures along the way;
-whether the first verification passed, the number of worker rounds, and whether
-you took the task over and why; the sign-off verdict and its findings; remaining
+which worker typed it; whether a self-check failed and whether the worker
+recovered; whether the first verification passed, the number of worker rounds,
+and whether you took the task over and why; the sign-off verdict and its findings; remaining
 risks and anything you could not verify.
 
 `delegate stats` keeps these numbers across tasks: the share of tasks that passed
 their first verification, the share you took over, how often sign-off returned
-CHANGES, and the tokens each seat read and wrote. They show whether the worker
-is paying for itself.
+CHANGES, and the tokens each seat read and wrote. Its `by typist` lines give
+the first-pass rate, takeovers, self-check recoveries and OpenCode's reported
+cost for each worker. They show whether the worker is paying for itself.
 
 After reporting, tell the user to run `/clear` before the next unrelated task.
 The token count for a task starts at the session's start, so a fresh session per
@@ -307,7 +342,7 @@ task keeps the numbers clean.
 
 ## Commands
 
-    delegate check                 preflight: opencode, model, agent, credentials
+    delegate check [--typist deepseek|sol]   preflight: which worker, opencode, model, agent, credentials
     delegate takeover <task> --reason "..."   you take the task over from the worker
     delegate status [<task>]       rounds, verification, sign-off, session
     delegate stats                 every task so far: rounds, first-pass rate, takeovers, CHANGES rate, tokens by seat

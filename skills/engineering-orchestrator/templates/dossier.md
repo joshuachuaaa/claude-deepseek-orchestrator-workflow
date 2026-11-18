@@ -39,4 +39,5 @@ for the user (if any are blocking, ask the user BEFORE calling the architect).
 - Files touched:
 - Risky domain (auth, money, data migration, concurrency, security, public API)? yes/no: which
 - Can acceptance tests be written before the code? yes/no: where they would live
-- Proposed typist: worker (DeepSeek) / Opus directly, and why
+- Proposed typist: worker / Opus directly, and why
+- Which worker (from `delegate check`): DeepSeek V4.1 Flash / GPT-6.2 Sol

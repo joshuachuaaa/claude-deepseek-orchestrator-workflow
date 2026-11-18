@@ -1,7 +1,7 @@
 #!/bin/sh
 # Installs the engineering-orchestrator workflow:
 #   - the skill and its subagents into Claude Code
-#   - the worker agent into OpenCode
+#   - the two worker agents (DeepSeek, GPT-6.2 Sol) into OpenCode
 #   - `delegate` onto your PATH
 # A file that already exists and differs is left alone unless you pass --force.
 set -eu
@@ -34,7 +34,9 @@ put "$here/$skill/templates/dossier.md"  "$claude/$skill/templates/dossier.md"
 for agent in fable-architect fable-signoff test-runner; do
     put "$here/agents/$agent.md" "$claude/agents/$agent.md"
 done
-put "$here/opencode/agents/eng-implementer.md" "$opencode/agents/eng-implementer.md"
+for agent in eng-implementer eng-implementer-sol; do
+    put "$here/opencode/agents/$agent.md" "$opencode/agents/$agent.md"
+done
 
 target=$claude/$skill/scripts/delegate
 chmod +x "$target"

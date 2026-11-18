@@ -21,6 +21,7 @@ permissions:
   - { action: shell, resource: "*.config/opencode*", effect: deny }
   - { action: shell, resource: "*.local/share/opencode*", effect: deny }
   - { action: shell, resource: "*.claude/*", effect: deny }
+  - { action: shell, resource: "*.codex/*", effect: deny }
   - { action: shell, resource: "*.config/gcloud*", effect: deny }
   - { action: shell, resource: "*.aws/*", effect: deny }
   - { action: shell, resource: "*.gnupg*", effect: deny }

@@ -7,7 +7,7 @@ in the seat it is best at:
 |---|---|---|---|
 | Driver | the main Claude Code session | Opus 5.5, xhigh effort | explores, writes the acceptance tests, reviews, verifies, takes over when needed, reports |
 | Judge | `fable-architect` and `fable-signoff` subagents | Fable 5.2, high effort | designs risky or unclear changes, signs off the finished change, answers one consult |
-| Typist | `eng-implementer` agent in [OpenCode](https://opencode.ai) | DeepSeek V4.1 Flash | types the code from a written brief, in its own git worktree |
+| Typist | `eng-implementer` or `eng-implementer-sol` agent in [OpenCode](https://opencode.ai) | DeepSeek V4.1 Flash, or GPT-6.2 Sol | types the code from a written brief, in its own git worktree |
 
 Two helpers keep the driver's context small: the built-in Explore subagent does
 the searching, and a `test-runner` subagent (Haiku 5.5) runs the gate and returns
@@ -29,7 +29,9 @@ least as strong as the driver would apply to its own work:
 2. **Held-back checks.** Two to five checks the typist never sees, added after
    it has finished.
 3. **A measured diff.** The driver reviews the real diff and the real test exit
-   code, produced by the `delegate` script, not the typist's report.
+   code, produced by the `delegate` script, not the typist's report. Before the
+   driver sees a round, the script has already run the acceptance tests itself
+   and sent a failure back to the typist once (the self-check, below).
 4. **One correction, then takeover.** The typist gets one correction round per
    stage. If the gate still fails, the driver finishes the work itself, so the
    result is never worse than the driver working alone.
@@ -50,7 +52,7 @@ flowchart TD
     ARCH --> TESTS["Driver writes the<br/>acceptance tests first"]
     DBRIEF --> TESTS
     TESTS --> WT{"Who types?"}
-    WT -- "large, exactly specified,<br/>machine-checkable" --> WORK["DeepSeek worker types<br/>own worktree, tests seeded"]
+    WT -- "large, exactly specified,<br/>machine-checkable" --> WORK["Worker types (DeepSeek or Sol)<br/>own worktree, tests seeded, self-check"]
     WT -- "otherwise" --> DTYPE["Driver types"]
     WORK --> REV["Driver reviews the real diff<br/>and adds the held-back checks"]
     DTYPE --> GATE
@@ -81,7 +83,7 @@ flowchart TD
 ```
 
 Blue is the driver (Opus), purple is the judge (Fable), green is the typist
-(DeepSeek), and amber is the machine gate.
+(DeepSeek or Sol), and amber is the machine gate.
 
 ## One task, seat by seat
 
@@ -95,17 +97,20 @@ sequenceDiagram
     participant D as Driver, Opus 5.5
     participant J as Judge, Fable 5.2
     participant S as delegate script
-    participant W as Typist, DeepSeek
+    participant W as Typist, DeepSeek or Sol
 
     User->>D: /engineering-orchestrator and the task
     D->>D: Triage, discover, write dossier.md
     D->>J: Design from the dossier
     J-->>D: plan.md, brief.md, holdback.md
     D->>D: Write the acceptance tests
-    D->>S: delegate start with the brief and the tests
+    D->>S: delegate start with the brief, the tests and the check command
     S->>W: Brief, in a fresh worktree
     W-->>S: Commits and a report
-    S-->>D: Measured diff
+    S->>S: Self-check: run the acceptance tests
+    S->>W: The failure, once, if the self-check failed
+    W-->>S: Commits and a report
+    S-->>D: Measured diff and the self-check result
     D->>D: Review the diff, add the held-back checks
     D->>S: delegate verify with the gate command
     S-->>D: Pass or fail, tied to the commit
@@ -126,19 +131,69 @@ sequenceDiagram
 | `agents/fable-architect.md` | Fable subagent: design, and one consult |
 | `agents/fable-signoff.md` | Fable subagent: final sign-off |
 | `agents/test-runner.md` | Haiku subagent: runs the gate, returns a short result |
-| `opencode/agents/eng-implementer.md` | the OpenCode worker agent, with hard denies for pushes, deploys, secrets and anything outside its worktree |
+| `opencode/agents/eng-implementer.md` | the OpenCode worker agent for DeepSeek, with hard denies for pushes, deploys, secrets and anything outside its worktree |
+| `opencode/agents/eng-implementer-sol.md` | the same agent for GPT-6.2 Sol; the two permission lists are kept identical |
+
+## The two workers
+
+| | `deepseek` | `sol` |
+|---|---|---|
+| Model in OpenCode | `lithosai/deepseek-ai/DeepSeek-V4.1-Flash` | `openai/gpt-6.2-sol` |
+| Effort, implementation round | max | high |
+| Effort, correction round (`delegate fix`) | max | xhigh |
+| Brief | spells out the internal structure | exact contracts and files to read; internals left to the worker |
+| Worth dispatching from | about 200 lines | about 100 lines |
+
+DeepSeek is the default. To make Sol the default, set `ENG_ORCH_TYPIST=sol` in
+your shell profile; to use it for one task, name it in the request (the driver
+then passes `--typist sol`). `delegate check` prints which one is in force.
+
+Sol costs many times what DeepSeek does per token, so it cannot make the typist
+seat cheaper. It pays for itself only if it takes work off the driver: fewer
+correction rounds, fewer takeovers, shorter briefs. `delegate stats` has a
+`by typist` section so you can see whether it does on your own tasks. Run some
+tasks on each before deciding.
+
+Sol's effort ladder is deliberate. High is used for implementation because
+launch-week measurements put xhigh about one index point above high for more
+than twice the cost. The correction round, where the worker has already failed
+once, is the place for xhigh. A later stage of a staged plan
+(`delegate fix --stage`) is new work and runs at high.
+
+If you sign in to OpenAI in OpenCode with a ChatGPT plan instead of an API key,
+Sol rounds draw on that plan's Codex limits and not on API credit.
+
+### The self-check
+
+`delegate start --check '<command>'` gives the script one shell command that
+runs the acceptance tests. When the worker says it has finished, the script
+runs the command on the committed worktree. If it fails, or a seeded acceptance
+test was changed, the script sends the output straight back into the worker's
+own session, once, and checks again. A worker that stopped early or broke a
+test hears about it at cached-input prices, without the driver spending a
+review and its one correction round on it.
+
+The self-check is not a worker round and does not replace `delegate verify`:
+the gate still runs the held-back checks and the wider suite. Files the check
+command leaves behind are removed, so they never reach the diff.
+`ENG_ORCH_SELFCHECK_RETRIES` (default 1) and `ENG_ORCH_SELFCHECK_TIMEOUT_MIN`
+(default 15) tune it.
 
 ## Requirements
 
 - Claude Code with access to Opus 5.5, Fable 5.2 and Haiku 5.5
-- OpenCode with a provider that serves DeepSeek V4.1 Flash
+- OpenCode with a provider that serves DeepSeek V4.1 Flash, or with OpenAI
+  signed in for GPT-6.2 Sol, or both
 - git and Python 3
 
-The worker's model is named in two places: the `model:` line in
-`opencode/agents/eng-implementer.md`, and the `PROVIDER`, `MODEL_ID` and `VARIANT`
-constants at the top of `delegate`. Both use the OpenCode provider id `lithosai`.
-If your provider has a different id, change both. There is no fallback model on
-purpose: if a round was served by anything else, `delegate` fails loudly.
+Each worker's model is named in two places: the `model:` line of its agent file
+under `opencode/agents/`, and its entry in the `WORKERS` table at the top of
+`delegate`. The DeepSeek entry uses the OpenCode provider id `lithosai`, and the
+Sol entry uses `openai` with the effort variants `high` and `xhigh`. Run
+`opencode models` to see the ids on your machine, and change both places if
+yours differ. To try another model in the Sol seat (GPT-6.1 Sol, say), change
+the same two places. There is no fallback model on purpose: if a round was
+served by anything else, `delegate` fails loudly.
 
 ## Install
 
@@ -150,14 +205,19 @@ git clone https://github.com/joshuachuaaa/claude-deepseek-orchestrator-workflow.
 cd claude-deepseek-orchestrator-workflow && ./install.sh
 ```
 
-The installer copies the skill and subagents into `~/.claude`, the worker agent
-into `~/.config/opencode/agents`, and links `delegate` into `~/.local/bin`. It
-leaves any existing file that differs alone unless you pass `--force`.
+The installer copies the skill and subagents into `~/.claude`, the two worker
+agents into `~/.config/opencode/agents`, and links `delegate` into
+`~/.local/bin`. It leaves any existing file that differs alone unless you pass
+`--force`.
 
-Then, inside a git repository:
+Then, inside a git repository, check the worker you mean to use:
 
 ```bash
-delegate check
+delegate check --typist deepseek
+```
+
+```bash
+delegate check --typist sol
 ```
 
 To avoid permission prompts for the script and its task folders, add these to
@@ -188,21 +248,22 @@ In a Claude Code session running Opus 5.5, inside the project's git repository:
 ```
 
 The skill only runs when you type its name. It starts with a triage line such as
-`Triage: design=fable, typist=worker, pieces=1, signoff=yes`, and it will tell
-you to do the task directly if it is too small to be worth the overhead.
+`Triage: design=fable, typist=worker (sol), pieces=1, signoff=yes`, and it will
+tell you to do the task directly if it is too small to be worth the overhead.
 
 Two marker files in a repository's root switch seats off:
 
-- `.no-delegate`: no code is sent to the DeepSeek worker; the driver types.
+- `.no-delegate`: no code is sent to either worker's provider; the driver types.
 - `.no-fable`: no Fable subagents; the driver designs and sign-off is skipped.
 
 ## Commands
 
 ```
-delegate check                            preflight: opencode, model, agent, credentials
+delegate check [--typist deepseek|sol]    preflight: which worker, opencode, model, agent, credentials
 delegate prep <task>                      task folder and dossier template
-delegate start <task> --spec FILE --tests DIR [--plan FILE] [--signoff]
+delegate start <task> --spec FILE --tests DIR --check CMD [--typist deepseek|sol] [--plan FILE] [--signoff]
 delegate fix <task> --feedback FILE       one correction round
+delegate fix <task> --feedback FILE --stage [--check CMD]   the next stage of a staged plan
 delegate takeover <task> --reason TEXT    the driver takes the task over
 delegate verify <task> -- <command>       the gate; evidence tied to a commit
 delegate package <task>                   sign-off package
@@ -220,16 +281,22 @@ Task records live in `~/.local/state/eng-orch` and worktrees in
 
 `delegate stats` reports, across every task: how many passed the gate the first
 time, how many the driver took over, how often sign-off returned CHANGES, and
-the tokens each seat read and wrote. Those numbers show whether the typist is
-paying for itself. A fresh Claude Code session per task keeps the token counts
-clean.
+the tokens each seat read and wrote. Its `by typist` section gives, for each
+worker, the first-pass rate, the takeovers, the average rounds, the cost as
+OpenCode reports it, and how often the self-check failed and the worker
+recovered. Those numbers show whether the typist is paying for itself. A fresh
+Claude Code session per task keeps the token counts clean.
 
 ## Status
 
 This is new. The script has been exercised end to end against scratch
 repositories with a stand-in worker, but there are no measurements from real
 tasks yet, so no claim is made here about cost or quality against a single
-model.
+model. That includes the Sol worker, the effort ladder and the self-check: they
+have run against the stand-in only, not against GPT-6.2 Sol in OpenCode, and
+the OpenCode ids for Sol (`openai/gpt-6.2-sol`, variants `high` and `xhigh`) are
+the expected ones, not confirmed ones. `delegate check --typist sol` will tell
+you if they are wrong.
 
 ## License
 
