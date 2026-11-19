@@ -16,8 +16,11 @@ With `start --check CMD` the script runs CMD itself when a worker says it has fi
 and sends a failure straight back into the worker's session (once per round) before the
 driver is involved.
 
-As soon as a worker's session has started, the script prints a `resume` line: the command
-that opens that session (`codex resume` or `opencode -s`), so the user can follow the round.
+As a worker's round starts, the script prints the command that follows it live. For Codex it
+is `delegate watch <task>`, which only reads the events this script records: `codex resume`
+would take the session over, and the next round would fail while it is open. For OpenCode it
+is `opencode -s <id>`, printed once the session has started; OpenCode's window attaches to the
+running session without getting in its way.
 
 Everything the orchestrator reviews is produced here (diff, commit, test exit code),
 not taken from the typist's own report.
@@ -35,6 +38,7 @@ Commands (run from inside the project's git repository):
   delegate package <task>                   sign-off package for the architect
   delegate signoff <task> --verdict ACCEPT|CHANGES --file FILE
   delegate integrate <task>
+  delegate watch <task>                     follow a Codex worker's rounds live (read-only)
   delegate status [<task>]
   delegate stats                            all tasks, all repositories, with token usage by seat
   delegate cleanup <task> [--force]
@@ -467,9 +471,22 @@ def worker_turn(st, w, model, message, stem, timeout_s, announce=True):
 
 
 def resume_line(st, w):
-    """The command that opens the worker's session, so the user can follow it."""
+    """The command that opens the worker's session itself."""
     opener = "codex resume" if w["runner"] == "codex" else "opencode -s"
     return f"cd {shlex.quote(st['worktree'])} && {opener} {st['session_id']}"
+
+
+def watch_line(st):
+    return f"cd {shlex.quote(st['worktree'])} && delegate watch {st['task']}"
+
+
+def follow_line(st, w):
+    """What the user runs to follow a round live. For Codex, `delegate watch`: `codex resume` takes the
+    session over, and the next round fails while that window is open. OpenCode's own window attaches
+    to the running session, and needs the session id."""
+    if w["runner"] == "codex":
+        return f"watch      {watch_line(st)}"
+    return f"resume     {resume_line(st, w)}"
 
 
 def first_session_id(events, w):
@@ -491,14 +508,14 @@ def first_session_id(events, w):
 
 
 def run_turn(st, w, cmd, stdin_file, events, errlog, timeout_s, announce):
-    """Run the runner's command with its events going to a file. As soon as the session id is known
-    (at once when the task already has one, otherwise from the first event that carries it), save it
-    and print the `resume` line, flushed, so the user can follow the round while it runs.
-    Returns (exit code, timed out)."""
+    """Run the runner's command with its events going to a file. When `announce` is set, print the
+    line that follows the round, flushed, as soon as it can be written: at once for Codex or when the
+    task already has a session, otherwise once the first event names the session. A new session's id
+    is saved as soon as it is known. Returns (exit code, timed out)."""
     wt = st["worktree"]
-    shown = False
-    if announce and st.get("session_id"):
-        print(f"resume     {resume_line(st, w)}", flush=True)
+    shown = not announce
+    if not shown and (w["runner"] == "codex" or st.get("session_id")):
+        print(follow_line(st, w), flush=True)
         shown = True
     deadline = time.monotonic() + timeout_s
     with open(events, "w") as out, open(errlog, "w") as err, open(stdin_file or os.devnull, "rb") as inp:
@@ -508,13 +525,14 @@ def run_turn(st, w, cmd, stdin_file, events, errlog, timeout_s, announce):
                 return p.wait(timeout=2), False
             except subprocess.TimeoutExpired:
                 pass
-            if announce and not shown:
-                sid = st.get("session_id") or first_session_id(events, w)
+            if not st.get("session_id"):
+                sid = first_session_id(events, w)
                 if sid:
                     st["session_id"] = sid
                     save_state(st)   # the session id must survive a crash, or the next round starts a new session
-                    print(f"resume     {resume_line(st, w)}", flush=True)
-                    shown = True
+            if not shown and st.get("session_id"):
+                print(follow_line(st, w), flush=True)
+                shown = True
             if time.monotonic() >= deadline:
                 p.kill()
                 p.wait()
@@ -671,6 +689,12 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     deadline = time.monotonic() + timeout_min * 60
     print(f"== worker round {n} ({kind}) for task '{st['task']}' is running on {model} ==", flush=True)
     rc, timed_out, report, errors, errlog = worker_turn(st, w, model, brief, f"round-{n}", timeout_min * 60)
+    if rc != 0 and w["runner"] == "codex" and session_in_use(errlog):
+        raise Fail(f"the Codex session {st['session_id']} is open somewhere else (a `codex resume` window or "
+                   "the Codex app), so Codex refused this round before it started. Nothing ran, and the round "
+                   "was not counted. Ask the user to close that window; Codex lets go of the session about a "
+                   "minute later. Then run the same command again. To follow a round, use "
+                   f"`delegate watch {st['task']}`: it only reads, so it cannot block a round.")
     # Capture whatever the worker left behind, so the diff is complete and reviewable.
     committed = capture(st, f"worker round {n}")
 
@@ -716,7 +740,11 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     print(f"worktree   {wt}")
     print(f"branch     {st['branch']}   base {st['base'][:10]}")
     print(f"session    {session_id}")
-    print(f"resume     cd {shlex.quote(wt)} && {'codex resume' if codex else 'opencode -s'} {session_id}")
+    if codex:
+        print(f"watch      {watch_line(st)}")
+        print(f"resume     {resume_line(st, w)}   (takes the session over: close it before the next round)")
+    else:
+        print(f"resume     {resume_line(st, w)}")
     print(f"exit       {rc}{'  (TIMED OUT after %d min)' % timeout_min if timed_out else ''}")
     print(f"model      {model}")
     print(f"served by  {', '.join(sorted(served)) if served else 'UNKNOWN (no session record found)'}")
@@ -774,6 +802,140 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     if rc != 0:
         raise Fail(f"{w['runner']} exited {rc}. No fallback model is used. If the provider is down, stop and "
                    "tell the user.")
+
+
+# ---------------------------------------------------------------- following a round
+
+# What Codex writes to stderr when another process (a `codex resume` window, the Codex app's
+# background server) holds the session: the turn is refused before anything runs.
+SESSION_IN_USE = "already has an active writer"
+FILE_CHANGE = {"add": "added", "update": "edited", "delete": "deleted"}
+
+
+def session_in_use(errlog):
+    try:
+        return SESSION_IN_USE in Path(errlog).read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def shell_command(cmd):
+    """`/usr/bin/zsh -lc 'git status'` -> `git status`: Codex wraps each command in the user's shell."""
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return cmd
+    return parts[2] if len(parts) == 3 and parts[1] in ("-c", "-lc") else cmd
+
+
+def codex_event_lines(ev, wt, label):
+    """What `delegate watch` prints for one event of `codex exec --json`: a list of lines."""
+    kind, item = ev.get("type"), ev.get("item") or {}
+    t = item.get("type")
+    if kind == "item.started" and t == "command_execution":
+        return [f"$ {shell_command(item.get('command') or '')}".replace("\n", "\n  ")]
+    if kind in ("item.started", "item.updated") and t == "todo_list":
+        return ["plan:", *(f"  [{'x' if i.get('completed') else ' '}] {i.get('text')}" for i in item.get("items") or [])]
+    if kind == "turn.completed":
+        out = (ev.get("usage") or {}).get("output_tokens")
+        return [f"-- turn finished{f' ({tokens(out)} output tokens)' if out else ''}"]
+    if kind in ("turn.failed", "error"):
+        return [f"-- FAILED: {json.dumps(ev.get('error') or ev.get('message') or ev)[:500]}"]
+    if kind != "item.completed":
+        return []
+    if t == "agent_message":
+        return [f"{label}: {(item.get('text') or '').strip()}"]
+    if t == "reasoning":
+        return [f"  (thinking) {(item.get('text') or '').strip()[:300]}"]
+    if t == "command_execution":
+        output = (item.get("aggregated_output") or "").rstrip().splitlines()
+        code = item.get("exit_code")
+        what = shell_command(item.get("command") or "").splitlines() or [""]
+        what = what[0][:60] + ("..." if len(what) > 1 or len(what[0]) > 60 else "")
+        lines = [f"  -> exit {code}, {len(output)} line{'' if len(output) == 1 else 's'} of output: {what}"]
+        if code not in (0, None):
+            lines += [f"     {x}" for x in output[-5:]]
+        return lines
+    if t == "file_change":
+        lines = []
+        for c in item.get("changes") or []:
+            p = Path(c.get("path") or "?")
+            try:
+                p = p.relative_to(wt)
+            except ValueError:
+                pass
+            lines.append(f"  {FILE_CHANGE.get(c.get('kind'), c.get('kind'))} {p}")
+        return lines
+    if t == "error":
+        return [f"  notice: {item.get('message')}"]
+    if t == "mcp_tool_call":
+        return [f"  tool {item.get('server')}.{item.get('tool')} ({item.get('status')})"]
+    if t == "web_search":
+        return [f"  search {item.get('query')}"]
+    return [f"  [{t}]"] if t else []
+
+
+def turn_files(d: Path):
+    """The events files of the task's worker turns, in order: round-N, then its self-check retries."""
+    found = []
+    for p in d.glob("round-*.events.jsonl"):
+        m = re.fullmatch(r"round-(\d+)(?:\.selfcheck-(\d+))?\.events\.jsonl", p.name)
+        if m:
+            found.append(((int(m.group(1)), int(m.group(2) or 0)), p))
+    return [p for _, p in sorted(found)]
+
+
+def cmd_watch(a):
+    """Print a Codex worker's turns as they happen, from the events file the script records. It never
+    opens the Codex session, so it cannot block a round, and it keeps following later rounds."""
+    st = load_state(repo_root(), task_name(a.task))
+    typist = typist_name(st.get("typist", "deepseek"))
+    if typist == "opus":
+        raise Fail("this task's typist is the opus-typist subagent, which runs inside Claude Code.")
+    w = WORKERS[typist]
+    if w["runner"] != "codex":
+        print(f"{w['label']} runs in OpenCode, whose own window follows the round live:")
+        print(f"  {resume_line(st, w)}" if st.get("session_id")
+              else "  (no session yet: run this again once the round has started)")
+        return
+    d, wt = Path(st["state_dir"]), st["worktree"]
+    print(f"following task '{st['task']}' ({w['label']}). Read-only; Ctrl-C stops it.", flush=True)
+    current, pos, buf, finished = None, 0, b"", None
+    try:
+        while d.is_dir():
+            files = turn_files(d)
+            if files and files[-1] != current:
+                current, pos, buf = files[-1], 0, b""
+                print(f"\n== {current.name[:-len('.events.jsonl')]} ==", flush=True)
+            if current:
+                try:
+                    if current.stat().st_size < pos:   # the file was started again (a refused round run again)
+                        pos, buf = 0, b""
+                    with open(current, "rb") as f:
+                        f.seek(pos)
+                        buf += f.read()
+                        pos = f.tell()
+                    *complete, buf = buf.split(b"\n")
+                    for raw in complete:
+                        try:
+                            ev = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        for line in codex_event_lines(ev, wt, w["label"]):
+                            print(line, flush=True)
+                    n = int(re.match(r"round-(\d+)", current.name).group(1))
+                    report = d / f"round-{n}.report.md"
+                    if n != finished and report.exists() and report.stat().st_mtime >= current.stat().st_mtime:
+                        finished = n
+                        print(f"\n== round {n} is over; waiting for the next one (Ctrl-C stops this) ==",
+                              flush=True)
+                except FileNotFoundError:   # the task was cleaned up between two looks
+                    break
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print()
+        return
+    print("\nthe task's records were closed (`delegate cleanup`); nothing more to follow.")
 
 
 # ---------------------------------------------------------------- a round typed by a Claude subagent
@@ -853,7 +1015,7 @@ def cmd_round(a):
 def note_session(a):
     """Remember which Claude Code session worked on a task, so `stats` can read its token usage."""
     sid, task = os.environ.get("CLAUDE_CODE_SESSION_ID"), getattr(a, "task", None)
-    if not sid or not task or a.cmd in ("status", "cleanup"):   # housekeeping is not work on the task
+    if not sid or not task or a.cmd in ("status", "cleanup", "watch"):   # not work on the task
         return
     try:
         d = state_dir(repo_root(), task_name(task))
@@ -1484,6 +1646,8 @@ def main():
     s.add_argument("--verdict", required=True); s.add_argument("--file", required=True)
     s.set_defaults(fn=cmd_signoff)
     s = sub.add_parser("integrate"); s.add_argument("task"); s.set_defaults(fn=cmd_integrate)
+    s = sub.add_parser("watch", help="follow a Codex worker's rounds live; read-only")
+    s.add_argument("task"); s.set_defaults(fn=cmd_watch)
     sub.add_parser("stats").set_defaults(fn=cmd_stats)
     s = sub.add_parser("status"); s.add_argument("task", nargs="?"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("cleanup"); s.add_argument("task"); s.add_argument("--force", action="store_true")

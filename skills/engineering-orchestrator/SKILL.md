@@ -191,12 +191,19 @@ round and costs you nothing; always pass it. Pass `--plan`
 when Fable designed (this makes sign-off mandatory). Pass `--signoff` when you
 designed but the change is risky. Run it with the Bash tool's
 `run_in_background` and wait for it to finish; do not poll more than every few
-minutes. The one exception: as soon as the worker's session starts (usually
-within a minute) the script prints a `resume` line, `cd <worktree> && codex
-resume <id>` for Sol or `cd <worktree> && opencode -s <id>` for DeepSeek. Read
-the background output once, about a minute after starting, and give that line
-to the user so they can open the session and follow the round. The same line
-prints at the start of every `delegate fix` round.
+minutes. The one exception: the script prints a line for following the round,
+`watch  cd <worktree> && delegate watch <task>` for Sol (at once) or
+`resume  cd <worktree> && opencode -s <id>` for DeepSeek (once the session
+starts, usually within a minute). Read the background output once, about a
+minute after starting, and give that line to the user so they can follow the
+round. The same line prints at the start of every `delegate fix` round.
+`delegate watch` only reads, and keeps following the task's later rounds.
+
+While a Sol task is open, never give the user `codex resume`: it takes the
+Codex session over, and the next round fails while that window is open. If a
+round stops with "the Codex session ... is open somewhere else", nothing ran
+and the round was not counted: ask the user to close that window, wait a
+minute, and run the same command again.
 
 Sol runs in Codex's sandbox: it can write only inside its worktree, its
 commands have no network, and it cannot commit (the script commits what it
@@ -373,6 +380,7 @@ task keeps the numbers clean.
 
     delegate check [--typist sol-codex|deepseek-opencode]   preflight: which worker, its CLI, model, sandbox or agent, sign-in
     delegate takeover <task> --reason "..."   you take the task over from the worker
+    delegate watch <task>          follow a Sol round live, read-only (for the user's terminal)
     delegate status [<task>]       rounds, verification, sign-off, session
     delegate stats                 every task so far: rounds, first-pass rate, takeovers, CHANGES rate, tokens by seat
     delegate cleanup <task> --force    discard an unintegrated task (ask the user first)

@@ -340,17 +340,32 @@ and the typist keeps its context.
 
 ### Following a round
 
-As soon as the typist's session has started, usually within a minute, the
-script prints a `resume` line, and prints it again in the round's summary:
+As a round starts, the script prints a line for following it, and the driver
+passes it on to you. For `sol-codex`:
 
 ```
-resume     cd <worktree> && codex resume <session id>
+watch      cd <worktree> && delegate watch <task>
 ```
 
-For `deepseek-opencode` it is `cd <worktree> && opencode -s <session id>`. The
-driver passes the line on to you; open it in a terminal to watch the typist
-work. Only watch. A message typed there runs outside the script, and a turn on
-another model or sandbox fails the next round's record check.
+Run it in a terminal. It prints the typist's messages, the commands it runs
+with their exit codes, and the files it changes, as they happen. It only reads
+the events the script records and never opens the Codex session, so it cannot
+get in the way of this round or the next. It keeps following the task's later
+rounds until you press Ctrl-C or the task is cleaned up.
+
+Don't follow a Sol round with `codex resume`. It hands the session to Codex,
+which locks it. Opened during a round, the window shows a snapshot that
+doesn't update. Opened between rounds, it makes the next round fail until the
+window has been closed for about a minute. When that happens the script says
+so, and the round isn't counted. `codex resume` is fine for looking back once
+the task is done; the round's summary prints it.
+
+For `deepseek-opencode` the line is `resume     cd <worktree> && opencode -s
+<session id>`, printed once the session has started, usually within a minute.
+OpenCode's window attaches to the running session and updates live, and later
+rounds run normally while it is open. Only watch there. Esc interrupts the
+typist, and a message typed there runs outside the script, so a turn on
+another model fails the next round's record check.
 
 ### The self-check
 
@@ -385,6 +400,7 @@ The driver runs these for you. You may want `check`, `status`, `stats` and
 | `delegate package <task>` | Builds the sign-off package |
 | `delegate signoff <task> --verdict ACCEPT\|CHANGES --file FILE` | Records the judge's verdict |
 | `delegate integrate <task>` | Squashes the work into your checkout, staged and not committed |
+| `delegate watch <task>` | Follows a Sol round live, read-only |
 | `delegate status [<task>]` | Where a task stands |
 | `delegate stats` | Every task so far: rounds, first-pass rate, takeovers, tokens by seat |
 | `delegate cleanup <task> [--force]` | Removes the task's worktree and branch |
