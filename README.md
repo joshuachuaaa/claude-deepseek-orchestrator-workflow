@@ -314,12 +314,25 @@ and the typist keeps its context.
 
 ### `sol-codex`
 
-- **First turn.** `codex exec --json -m gpt-6.2-sol -c
-  model_reasoning_effort="xhigh" -s workspace-write -C <worktree>`, with the brief
-  on standard input.
-- **Later turns.** `codex exec resume <session id>`, at the effort for that
-  turn. Changing the effort on a resumed turn keeps the prompt cache; that was
-  measured.
+- **Where it runs.** Inside the Codex service, the background
+  `codex app-server`. The script talks to it over its control socket
+  (`~/.codex/app-server-control/app-server-control.sock`, JSON-RPC over a
+  websocket):
+  - The first turn starts a session with model `gpt-6.2-sol`, sandbox
+    `workspace-write`, approvals off and the worktree as its directory.
+  - Later turns resume that session.
+  - Each turn runs at xhigh effort.
+  - The script writes the turn's events in the same shape `codex exec --json`
+    prints.
+- **When the service isn't available.** The service's protocol is marked
+  experimental by OpenAI, so if anything goes wrong before a turn starts, the
+  turn runs as `codex exec` instead.
+  - The first turn is `codex exec --json -m gpt-6.2-sol -c
+    model_reasoning_effort="xhigh" -s workspace-write -C <worktree>`, with the
+    brief on standard input.
+  - Later turns are `codex exec resume <session id>`, at the effort for that
+    turn. Changing the effort on a resumed turn keeps the prompt cache; that
+    was measured.
 - **The sandbox.** The typist can write only inside its worktree and the temp
   directory, and its commands have no network. It cannot commit, so the script
   commits what it leaves. A test command that needs the network will not run
@@ -344,21 +357,44 @@ As a round starts, the script prints a line for following it, and the driver
 passes it on to you. For `sol-codex`:
 
 ```
-watch      cd <worktree> && delegate watch <task>
+resume     cd <worktree> && codex resume <session id>
 ```
 
-Run it in a terminal. It prints the typist's messages, the commands it runs
-with their exit codes, and the files it changes, as they happen. It only reads
-the events the script records and never opens the Codex session, so it cannot
-get in the way of this round or the next. It keeps following the task's later
-rounds until you press Ctrl-C or the task is cleaned up.
+Sol's rounds run inside the Codex service: the background `codex app-server`
+that the Codex app and `codex resume` windows talk to. Codex starts it on
+demand, and the script starts it too if it isn't running. Because the window
+and the round share that service, the window attaches to the running round
+and updates live. It can also stay open, and later rounds run normally. Things
+to know about it:
 
-Don't follow a Sol round with `codex resume`. It hands the session to Codex,
-which locks it. Opened during a round, the window shows a snapshot that
-doesn't update. Opened between rounds, it makes the next round fail until the
+- **It isn't read-only.** A message typed there goes to Sol, and Esc stops the
+  round.
+- **A typed message can block the next round.** A message typed between rounds
+  starts a turn of its own. If that turn is still running when the next round
+  starts, the round stops without sending anything and isn't counted.
+- **Run the line exactly as printed.** With a `-c` option, Codex runs its own
+  copy instead of using the service. That window can't follow the round: it
+  ends with "This conversation is open in another app". The round itself is
+  unaffected.
+- **The first window asks to trust the folder.** The first time you open a
+  task's worktree, Codex may ask whether to trust it.
+
+`delegate watch <task>` is the read-only alternative. It prints the typist's
+messages, the commands it runs with their exit codes, and the files it changes,
+as they happen, from the events the script records. It keeps following the
+task's later rounds until you press Ctrl-C or the task is cleaned up.
+
+**If the service can't be reached.** The round runs as its own `codex exec`
+instead, says so in a `note` line, and prints
+`watch      cd <worktree> && delegate watch <task>`. Don't open `codex resume`
+on such a round. It takes the session over, and the next round fails until the
 window has been closed for about a minute. When that happens the script says
-so, and the round isn't counted. `codex resume` is fine for looking back once
-the task is done; the round's summary prints it.
+so, and the round isn't counted. `ENG_ORCH_CODEX_VIA=exec` always runs rounds
+this way.
+
+**One side effect.** When the service runs a session for a repository, Codex
+marks that repository as trusted in `~/.codex/config.toml`. That is the same
+as answering yes to its trust question. `codex exec` doesn't do this.
 
 For `deepseek-opencode` the line is `resume     cd <worktree> && opencode -s
 <session id>`, printed once the session has started, usually within a minute.
@@ -416,6 +452,7 @@ Environment variables, all optional:
 |---|---|---|
 | `ENG_ORCH_TYPIST` | `sol-codex` | The typist used when the request names none |
 | `ENG_ORCH_SOL_MODEL` | `gpt-6.2-sol` | The Codex model in the `sol-codex` seat |
+| `ENG_ORCH_CODEX_VIA` | `service` | `service` runs Sol's rounds inside the Codex service (so `codex resume` follows them live), falling back to `codex exec`; `exec` always uses `codex exec` |
 | `ENG_ORCH_SELFCHECK_RETRIES` | `1` | How many times a self-check failure goes back to the typist in one round |
 | `ENG_ORCH_SELFCHECK_TIMEOUT_MIN` | `15` | How long one run of the check command may take |
 | `ENG_ORCH_TIMEOUT_MIN` | `45` | How long one typist round may take |
