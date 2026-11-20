@@ -376,8 +376,6 @@ to know about it:
   copy instead of using the service. That window can't follow the round: it
   ends with "This conversation is open in another app". The round itself is
   unaffected.
-- **The first window asks to trust the folder.** The first time you open a
-  task's worktree, Codex may ask whether to trust it.
 
 `delegate watch <task>` is the read-only alternative. It prints the typist's
 messages, the commands it runs with their exit codes, and the files it changes,
