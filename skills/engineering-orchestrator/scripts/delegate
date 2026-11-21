@@ -16,11 +16,14 @@ With `start --check CMD` the script runs CMD itself when a worker says it has fi
 and sends a failure straight back into the worker's session (once per round) before the
 driver is involved.
 
-As a worker's round starts, the script prints the command that follows it live. For Codex it
-is `delegate watch <task>`, which only reads the events this script records: `codex resume`
-would take the session over, and the next round would fail while it is open. For OpenCode it
-is `opencode -s <id>`, printed once the session has started; OpenCode's window attaches to the
-running session without getting in its way.
+As a worker's round starts, the script prints the command that follows it live. A Codex
+round runs inside the Codex service (the background `codex app-server` that the Codex app and
+`codex resume` windows talk to), so `codex resume <id>` follows it live and can stay open
+between rounds. When the service cannot be reached, or $ENG_ORCH_CODEX_VIA is `exec`, the
+round runs as its own `codex exec` instead: `codex resume` would then take the session over,
+so the line printed is `delegate watch <task>`, which only reads the events this script
+records (it works for both). For OpenCode it is `opencode -s <id>`, printed once the session
+has started; OpenCode's window attaches to the running session without getting in its way.
 
 Everything the orchestrator reviews is produced here (diff, commit, test exit code),
 not taken from the typist's own report.
@@ -46,6 +49,7 @@ Commands (run from inside the project's git repository):
 Stdlib only. State lives in ~/.local/state/eng-orch, worktrees in ~/.local/share/eng-orch.
 """
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -53,6 +57,9 @@ import os
 import re
 import shlex
 import shutil
+import signal
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -85,6 +92,10 @@ def codex_exe():
 # commands no network. The repository's git directory is outside the worktree, so the worker
 # cannot commit; the script commits for it.
 CODEX_SANDBOX = "workspace-write"
+# How a Codex turn runs: `service` (inside the Codex service, so `codex resume` can follow it live;
+# a turn that cannot reach the service runs as `codex exec`) or `exec` (always `codex exec`).
+CODEX_VIA = os.environ.get("ENG_ORCH_CODEX_VIA", "service")
+CODEX_VIAS = ("service", "exec")
 # The short names older commands and task records used.
 ALIASES = {"sol": "sol-codex", "deepseek": "deepseek-opencode"}
 
@@ -352,6 +363,18 @@ def preflight_codex(typist, w, verbose):
         print(f"{'ok ' if signed_in else 'NO '} sign-in       {how if signed_in else 'NOT SIGNED IN (codex login)'}")
     if not signed_in:
         raise Fail("Codex is not signed in. Run `codex login`.")
+    if verbose:
+        # Not a failure either way: a round that cannot reach the service runs as `codex exec`.
+        if CODEX_VIA != "service":
+            print(f"--  live view     off ($ENG_ORCH_CODEX_VIA={CODEX_VIA}): rounds run as `codex exec`; "
+                  "follow them with `delegate watch`")
+        else:
+            try:
+                connect_service().close()
+                print("ok  live view     the Codex service answers: `codex resume <id>` follows a round live")
+            except ServiceUnavailable as e:
+                print(f"--  live view     the Codex service is not reachable ({e}): rounds run as `codex exec`; "
+                      "follow them with `delegate watch`")
 
 
 def preflight_opencode(typist, w, verbose):
@@ -406,8 +429,7 @@ def codex_usage(u):
 def codex_record(session_id, cwd):
     """Read the session file Codex keeps (`rollout-*-<id>.jsonl`): a `turn_context` line per turn
     names the model, the effort, the directory and the sandbox that turn ran with."""
-    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-    files = sorted(home.glob(f"sessions/**/rollout-*{session_id}.jsonl"))
+    files = sorted(codex_home().glob(f"sessions/**/rollout-*{session_id}.jsonl"))
     if not files:
         return None, None, None, None
     provider, seen, sandboxes, dirs, usage = "openai", set(), set(), [], None
@@ -481,12 +503,15 @@ def watch_line(st):
 
 
 def follow_line(st, w):
-    """What the user runs to follow a round live. For Codex, `delegate watch`: `codex resume` takes the
-    session over, and the next round fails while that window is open. OpenCode's own window attaches
-    to the running session, and needs the session id."""
-    if w["runner"] == "codex":
-        return f"watch      {watch_line(st)}"
-    return f"resume     {resume_line(st, w)}"
+    """What the user runs to follow a round live. OpenCode's own window attaches to the running
+    session, and so does `codex resume` when the round runs inside the Codex service; both need the
+    session id. A round run as `codex exec` gets `delegate watch`: `codex resume` would take that
+    session over, and the next round would fail while the window is open."""
+    if w["runner"] == "opencode":
+        return f"resume     {resume_line(st, w)}"
+    if st.get("codex_via") == "service":
+        return f"resume     {resume_line(st, w)}   (live; typing there reaches {w['label']}, and Esc stops the round)"
+    return f"watch      {watch_line(st)}"
 
 
 def first_session_id(events, w):
@@ -540,19 +565,31 @@ def run_turn(st, w, cmd, stdin_file, events, errlog, timeout_s, announce):
 
 
 def codex_turn(st, w, model, message, stem, timeout_s, announce=True):
-    """One `codex exec` in the task's session. The message goes in on stdin, from a file kept
-    next to the round's other records."""
+    """One turn in the task's Codex session: inside the Codex service when it can take it, otherwise
+    as its own `codex exec` (the message goes in on stdin). Both leave the same events file, read
+    below. The message is kept next to the round's other records."""
     d, wt = Path(st["state_dir"]), st["worktree"]
     events, errlog, prompt = d / f"{stem}.events.jsonl", d / f"{stem}.stderr.log", d / f"{stem}.prompt.md"
     effort = model.rsplit("#", 1)[1]
-    opts = ["--json", "-m", w["model_id"], "-c", f'model_reasoning_effort="{effort}"']
-    if st.get("session_id"):
-        # `resume` takes neither -s nor -C: the sandbox goes in as a config value, the directory as cwd.
-        cmd = [codex_exe(), "exec", "resume", st["session_id"], *opts, "-c", f'sandbox_mode="{CODEX_SANDBOX}"', "-"]
-    else:
-        cmd = [codex_exe(), "exec", *opts, "-s", CODEX_SANDBOX, "-C", wt, "-"]
     prompt.write_text(message, encoding="utf-8")
-    rc, timed_out = run_turn(st, w, cmd, prompt, events, errlog, timeout_s, announce)
+    ran = None
+    if CODEX_VIA == "service":
+        try:
+            ran = service_turn(st, w, effort, message, events, errlog, timeout_s, announce)
+        except ServiceUnavailable as e:
+            print(f"note       the Codex service could not take this turn ({e}), so it runs as `codex exec`, "
+                  "which `codex resume` cannot follow live.", flush=True)
+    if ran is None:
+        st["codex_via"] = "exec"
+        opts = ["--json", "-m", w["model_id"], "-c", f'model_reasoning_effort="{effort}"']
+        if st.get("session_id"):
+            # `resume` takes neither -s nor -C: the sandbox goes in as a config value, the directory as cwd.
+            cmd = [codex_exe(), "exec", "resume", st["session_id"], *opts, "-c", f'sandbox_mode="{CODEX_SANDBOX}"',
+                   "-"]
+        else:
+            cmd = [codex_exe(), "exec", *opts, "-s", CODEX_SANDBOX, "-C", wt, "-"]
+        ran = run_turn(st, w, cmd, prompt, events, errlog, timeout_s, announce)
+    rc, timed_out = ran
     report, errors, usage, finished = "", [], None, False
     for line in events.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -609,6 +646,364 @@ def opencode_turn(st, w, model, message, stem, timeout_s, announce=True):
     st["updated"] = now()
     save_state(st)   # the session id must survive a crash, or the next round starts a new session
     return rc, timed_out, "\n".join(texts.get(last_msg, [])).strip(), errors, errlog
+
+
+# ---------------------------------------------------------------- the Codex service
+#
+# The Codex service (`codex app-server`, started on demand by Codex itself) runs sessions for
+# the Codex app and for `codex resume` windows. A turn this script runs inside it is the same
+# session those windows show, so the user can follow it live, and a window left open does not
+# block the next turn. It speaks JSON-RPC over a websocket on a Unix socket under ~/.codex.
+# OpenAI marks that protocol experimental, so anything that goes wrong before a turn starts
+# sends the turn to `codex exec` instead.
+
+SERVICE_CONNECT_S = 10      # to connect and say hello
+SERVICE_THREAD_S = 120      # to open or start the session
+SERVICE_STOP_S = 15         # for a turn to stop once interrupted
+
+
+class ServiceUnavailable(Exception):
+    """The service could not take the turn, and nothing has run."""
+
+
+class ServiceGone(Exception):
+    """The connection to the service broke."""
+
+
+class ServiceRefused(Exception):
+    """The service answered a request with an error."""
+
+
+class Stopped(Exception):
+    """delegate itself was told to stop (SIGTERM or SIGHUP) during a turn."""
+
+
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+
+
+def service_socket():
+    return codex_home() / "app-server-control" / "app-server-control.sock"
+
+
+class CodexService:
+    """One connection to the service: a minimal websocket client (standard library only)."""
+
+    def __init__(self, path):
+        self.sock, self.buf, self.parts, self.next_id = socket.socket(socket.AF_UNIX), b"", [], 0
+        try:
+            self.sock.settimeout(SERVICE_CONNECT_S)
+            self.sock.connect(str(path))
+            key = base64.b64encode(os.urandom(16)).decode()
+            self.sock.sendall(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+            while b"\r\n\r\n" not in self.buf:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise ServiceUnavailable("the service closed the connection")
+                self.buf += chunk
+        except OSError as e:
+            self.sock.close()
+            raise ServiceUnavailable(f"{path}: {e.strerror or e}")
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].decode(errors="replace")
+        if status.split()[1:2] != ["101"]:
+            self.sock.close()
+            raise ServiceUnavailable(f"the service did not open a websocket ({status})")
+
+    def _send_frame(self, data, opcode=1):
+        mask, n = os.urandom(4), len(data)
+        if n < 126:
+            head = struct.pack("!BB", 0x80 | opcode, 0x80 | n)
+        elif n < 65536:
+            head = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, n)
+        else:
+            head = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, n)
+        # Clients mask what they send; XOR as one big integer is fast enough for a 100 KB brief.
+        m = int.from_bytes((mask * (n // 4 + 1))[:n], "big")
+        body = (int.from_bytes(data, "big") ^ m).to_bytes(n, "big") if n else b""
+        try:
+            self.sock.sendall(head + mask + body)
+        except OSError as e:
+            raise ServiceGone(str(e))
+
+    def send(self, msg):
+        self._send_frame(json.dumps(msg).encode())
+
+    def _frame(self):
+        """(final, opcode, payload) of the first whole frame in the buffer, or None."""
+        b = self.buf
+        if len(b) < 2:
+            return None
+        n, i = b[1] & 0x7F, 2
+        if n == 126:
+            if len(b) < 4:
+                return None
+            n, i = struct.unpack("!H", b[2:4])[0], 4
+        elif n == 127:
+            if len(b) < 10:
+                return None
+            n, i = struct.unpack("!Q", b[2:10])[0], 10
+        mask = None
+        if b[1] & 0x80:
+            mask, i = b[i:i + 4], i + 4
+        if len(b) < i + n:
+            return None
+        data, self.buf = b[i:i + n], b[i + n:]
+        if mask:
+            data = bytes(x ^ mask[j % 4] for j, x in enumerate(data))
+        return b[0] & 0x80, b[0] & 0x0F, data
+
+    def recv(self, deadline):
+        """The next message from the service, or None once `deadline` (time.monotonic()) has passed."""
+        while True:
+            f = self._frame()
+            if f is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.sock.settimeout(min(left, 1.0))
+                try:
+                    chunk = self.sock.recv(65536)
+                except socket.timeout:
+                    continue
+                except OSError as e:
+                    raise ServiceGone(str(e))
+                if not chunk:
+                    raise ServiceGone("the service closed the connection")
+                self.buf += chunk
+                continue
+            final, opcode, data = f
+            if opcode == 9:          # ping
+                self._send_frame(data, 10)
+            elif opcode == 8:        # close
+                raise ServiceGone("the service closed the connection")
+            elif opcode in (0, 1, 2):
+                self.parts.append(data)
+                if final:
+                    raw, self.parts = b"".join(self.parts), []
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+
+    def request(self, method, params, deadline, on_message):
+        """Send one request and wait for its answer, passing everything else that arrives meanwhile
+        to `on_message`."""
+        self.next_id += 1
+        rid = self.next_id
+        self.send({"id": rid, "method": method, "params": params})
+        while True:
+            msg = self.recv(deadline)
+            if msg is None:
+                raise ServiceGone(f"no answer to {method}")
+            if msg.get("id") == rid and "method" not in msg:
+                if "error" in msg:
+                    raise ServiceRefused(f"{method}: {(msg['error'] or {}).get('message') or msg['error']}")
+                return msg.get("result") or {}
+            on_message(msg)
+
+    def hello(self, on_message=lambda msg: None):
+        self.request("initialize", {"clientInfo": {"name": "eng-orch-delegate", "version": "1"}},
+                     time.monotonic() + SERVICE_CONNECT_S, on_message)
+        self.send({"method": "initialized"})
+
+    def close(self):
+        try:
+            self._send_frame(b"", 8)
+        except ServiceGone:
+            pass
+        self.sock.close()
+
+
+def connect_service():
+    """A connection to the service that has said hello, starting the service once if it is not running."""
+    if not hasattr(socket, "AF_UNIX"):
+        raise ServiceUnavailable("this platform has no Unix sockets")
+    try:
+        svc = CodexService(service_socket())
+    except ServiceUnavailable as first:
+        try:
+            p = run([codex_exe(), "app-server", "daemon", "start"], check=False, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise ServiceUnavailable(f"{first}; starting it failed: {e}")
+        if p.returncode != 0:
+            raise ServiceUnavailable(f"{first}; `codex app-server daemon start` failed: "
+                                     f"{(p.stderr or p.stdout).strip()[:300]}")
+        svc = CodexService(service_socket())
+    try:
+        svc.hello()
+    except (ServiceGone, ServiceRefused) as e:
+        svc.close()
+        raise ServiceUnavailable(str(e))
+    return svc
+
+
+def snake(name):
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def exec_item(item):
+    """A service item in the shape `codex exec --json` gives it (`commandExecution` with `exitCode`
+    -> `command_execution` with `exit_code`), so one reader serves both."""
+    out = {snake(k): v for k, v in item.items()}
+    t = out["type"] = snake(item.get("type") or "")
+    if t == "file_change":
+        out["changes"] = [dict(c, kind=(c.get("kind") or {}).get("type") if isinstance(c.get("kind"), dict)
+                               else c.get("kind")) for c in item.get("changes") or []]
+    elif t == "reasoning":
+        parts = [*(item.get("summary") or []), *(item.get("content") or [])]
+        out["text"] = "\n".join(p if isinstance(p, str) else str((p or {}).get("text") or "") for p in parts)
+    return out
+
+
+def exec_usage(u):
+    return {"input_tokens": u.get("inputTokens") or 0, "cached_input_tokens": u.get("cachedInputTokens") or 0,
+            "cache_write_input_tokens": u.get("cacheWriteInputTokens") or 0,
+            "output_tokens": u.get("outputTokens") or 0,
+            "reasoning_output_tokens": u.get("reasoningOutputTokens") or 0}
+
+
+def service_turn(st, w, effort, message, events, errlog, timeout_s, announce):
+    """One turn inside the Codex service. Its events go to `events` in the shape `codex exec --json`
+    prints, so the rest of the script, and `delegate watch`, read both alike. Returns (exit code,
+    timed out). Raises ServiceUnavailable while nothing has run, so the caller can use `codex exec`."""
+    wt, sid = st["worktree"], st.get("session_id")
+    svc = connect_service()
+    turn = {"id": None, "status": None}
+    with open(events, "w") as out, open(errlog, "w") as err:
+        def emit(ev):
+            out.write(json.dumps(ev) + "\n")
+            out.flush()
+
+        def on_message(msg):
+            method, p = msg.get("method"), msg.get("params") or {}
+            if method and "id" in msg:
+                # A question from the service (an approval, a form). With approvals off none should
+                # come, and nobody is here to answer one: decline it so the turn does not wait.
+                err.write(f"declined a request from the Codex service: {method}\n")
+                err.flush()
+                svc.send({"id": msg["id"], "error": {"code": -32601, "message": "delegate cannot answer this"}})
+                return
+            if not method or (sid and p.get("threadId") not in (None, sid)):
+                return
+            if turn["id"] and p.get("turnId") not in (None, turn["id"]):
+                return
+            if method == "turn/started":
+                turn["id"] = turn["id"] or (p.get("turn") or {}).get("id")
+                emit({"type": "turn.started"})
+            elif method in ("item/started", "item/completed"):
+                item = p.get("item") or {}
+                if item.get("type") != "userMessage":
+                    emit({"type": method.replace("/", "."), "item": exec_item(item)})
+            elif method == "turn/plan/updated":
+                emit({"type": "item.updated", "item": {"type": "todo_list", "items": [
+                    {"text": s.get("step"), "completed": s.get("status") == "completed"} for s in p.get("plan") or []]}})
+            elif method == "thread/tokenUsage/updated":
+                total = (p.get("tokenUsage") or {}).get("total")
+                if isinstance(total, dict):
+                    turn["usage"] = exec_usage(total)   # the session's running total, as `codex exec` reports it
+            elif method == "error":
+                what = ((p.get("error") or {}).get("message")) or json.dumps(p)[:600]
+                if p.get("willRetry"):
+                    emit({"type": "item.completed", "item": {"type": "error", "message": what}})
+                else:   # the turn fails with it, and `turn/completed` carries it
+                    err.write(f"{what}\n")
+                    err.flush()
+            elif method == "turn/completed":
+                t = p.get("turn") or {}
+                if turn["id"] and t.get("id") != turn["id"]:
+                    return
+                turn["status"] = t.get("status") or "failed"
+                if turn["status"] == "completed":
+                    emit({"type": "turn.completed", "usage": turn.get("usage") or {}})
+                elif turn["status"] == "interrupted":
+                    emit({"type": "turn.failed", "error": {"message": "the turn was interrupted (Esc in a Codex "
+                                                                      "window, or delegate stopped it)"}})
+                else:
+                    emit({"type": "turn.failed", "error": t.get("error") or {"message": "the turn failed"}})
+
+        def stop_turn():
+            """Interrupt the running turn and wait briefly for it to stop."""
+            if not turn["id"] or turn["status"]:
+                return
+            until = time.monotonic() + SERVICE_STOP_S
+            try:
+                svc.request("turn/interrupt", {"threadId": sid, "turnId": turn["id"]}, until, on_message)
+                while not turn["status"]:
+                    msg = svc.recv(until)
+                    if msg is None:
+                        break
+                    on_message(msg)
+            except (ServiceGone, ServiceRefused):
+                pass
+
+        old_handlers = {}
+        try:
+            try:
+                common = {"cwd": wt, "model": w["model_id"], "sandbox": CODEX_SANDBOX, "approvalPolicy": "never"}
+                if sid:
+                    thread = svc.request("thread/resume", {"threadId": sid, "excludeTurns": True, **common},
+                                         time.monotonic() + SERVICE_THREAD_S, on_message).get("thread") or {}
+                else:
+                    thread = svc.request("thread/start", common, time.monotonic() + SERVICE_THREAD_S,
+                                         on_message).get("thread") or {}
+            except (ServiceGone, ServiceRefused) as e:
+                raise ServiceUnavailable(str(e))
+            if not thread.get("id"):
+                raise ServiceUnavailable("the service did not name the session")
+            if (thread.get("status") or {}).get("type") == "active":
+                raise Fail(f"{w['label']} is still working in session {thread['id']} (a turn typed in a Codex "
+                           "window, or a round whose delegate was killed). Nothing was sent, and the round was "
+                           "not counted. Wait for that turn to finish, or ask the user to stop it with Esc in "
+                           "`codex resume`, then run the same command again.")
+            new, sid = not sid, thread["id"]
+            st["session_id"], st["codex_via"] = sid, "service"
+            save_state(st)   # the session id must survive a crash, or the next round starts a new session
+            emit({"type": "thread.started", "thread_id": sid})
+            if new:
+                try:   # a name to find it by in Codex, like OpenCode's title
+                    svc.request("thread/name/set", {"threadId": sid, "name": f"eng-orch:{st['task']}"},
+                                time.monotonic() + SERVICE_CONNECT_S, on_message)
+                except (ServiceGone, ServiceRefused):
+                    pass
+            if announce:
+                print(follow_line(st, w), flush=True)
+
+            def stop(signum, frame):
+                raise Stopped(signal.Signals(signum).name)
+            for s in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+                if s is not None:
+                    old_handlers[s] = signal.signal(s, stop)
+            deadline = time.monotonic() + timeout_s
+            try:
+                r = svc.request("turn/start", {"threadId": sid, "model": w["model_id"], "effort": effort,
+                                               "input": [{"type": "text", "text": message}]}, deadline, on_message)
+                turn["id"] = turn["id"] or (r.get("turn") or {}).get("id")
+                while not turn["status"]:
+                    msg = svc.recv(deadline)
+                    if msg is None:
+                        stop_turn()
+                        return 124, True
+                    on_message(msg)
+            except ServiceRefused as e:
+                emit({"type": "error", "message": f"the Codex service refused the turn: {e}"})
+                return 1, False
+            except ServiceGone as e:
+                if time.monotonic() >= deadline:
+                    return 124, True
+                emit({"type": "error", "message": f"lost the Codex service during the turn: {e}"})
+                return 1, False
+            except (KeyboardInterrupt, Stopped) as e:
+                stop_turn()
+                if isinstance(e, Stopped):
+                    raise SystemExit(f"delegate: stopped by {e}; the turn was interrupted.")
+                raise
+        finally:
+            for s, h in old_handlers.items():
+                signal.signal(s, h)
+            svc.close()
+    return (0 if turn["status"] == "completed" else 1), False
 
 
 def capture(st, label):
@@ -740,7 +1135,11 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     print(f"worktree   {wt}")
     print(f"branch     {st['branch']}   base {st['base'][:10]}")
     print(f"session    {session_id}")
-    if codex:
+    if codex and st.get("codex_via") == "service":
+        print(follow_line(st, w))
+        print(f"watch      {watch_line(st)}   (read-only)")
+    elif codex:
+        print("ran as     codex exec (not inside the Codex service)")
         print(f"watch      {watch_line(st)}")
         print(f"resume     {resume_line(st, w)}   (takes the session over: close it before the next round)")
     else:
@@ -846,7 +1245,8 @@ def codex_event_lines(ev, wt, label):
     if t == "agent_message":
         return [f"{label}: {(item.get('text') or '').strip()}"]
     if t == "reasoning":
-        return [f"  (thinking) {(item.get('text') or '').strip()[:300]}"]
+        text = (item.get("text") or "").strip()
+        return [f"  (thinking) {text[:300]}"] if text else []
     if t == "command_execution":
         output = (item.get("aggregated_output") or "").rstrip().splitlines()
         code = item.get("exit_code")
@@ -900,6 +1300,9 @@ def cmd_watch(a):
         return
     d, wt = Path(st["state_dir"]), st["worktree"]
     print(f"following task '{st['task']}' ({w['label']}). Read-only; Ctrl-C stops it.", flush=True)
+    if st.get("codex_via") == "service" and st.get("session_id"):
+        print(f"(its rounds run in the Codex service, so Codex's own window follows them too: {resume_line(st, w)})",
+              flush=True)
     current, pos, buf, finished = None, 0, b"", None
     try:
         while d.is_dir():
@@ -1601,6 +2004,10 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     if DEFAULT_TYPIST not in TYPISTS:
         print(f"\ndelegate: ENG_ORCH_TYPIST is '{DEFAULT_TYPIST}'; it must be one of {', '.join(TYPISTS)}.",
+              file=sys.stderr)
+        sys.exit(2)
+    if CODEX_VIA not in CODEX_VIAS:
+        print(f"\ndelegate: ENG_ORCH_CODEX_VIA is '{CODEX_VIA}'; it must be one of {', '.join(CODEX_VIAS)}.",
               file=sys.stderr)
         sys.exit(2)
     s = sub.add_parser("check")

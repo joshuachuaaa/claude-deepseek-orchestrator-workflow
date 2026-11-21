@@ -192,18 +192,29 @@ when Fable designed (this makes sign-off mandatory). Pass `--signoff` when you
 designed but the change is risky. Run it with the Bash tool's
 `run_in_background` and wait for it to finish; do not poll more than every few
 minutes. The one exception: the script prints a line for following the round,
-`watch  cd <worktree> && delegate watch <task>` for Sol (at once) or
+`resume  cd <worktree> && codex resume <id>` for Sol (at once) or
 `resume  cd <worktree> && opencode -s <id>` for DeepSeek (once the session
 starts, usually within a minute). Read the background output once, about a
 minute after starting, and give that line to the user so they can follow the
-round. The same line prints at the start of every `delegate fix` round.
-`delegate watch` only reads, and keeps following the task's later rounds.
+round. The same line prints at the start of every `delegate fix` round. Both
+windows attach to the running session, update live, and can stay open between
+rounds. Tell the user to run the line exactly as printed (with a `-c` option,
+Codex runs its own copy, which cannot follow the round), that typing there
+reaches the worker, and that Esc stops the round. For Sol, `delegate watch
+<task>` is a read-only alternative.
 
-While a Sol task is open, never give the user `codex resume`: it takes the
-Codex session over, and the next round fails while that window is open. If a
-round stops with "the Codex session ... is open somewhere else", nothing ran
-and the round was not counted: ask the user to close that window, wait a
-minute, and run the same command again.
+Sol's rounds run inside the Codex service, which is what makes the
+`codex resume` line safe. If a round prints a `note` saying it runs as
+`codex exec` (the service could not be reached), its line is
+`watch  cd <worktree> && delegate watch <task>`: give that one, and do not
+give `codex resume` for that task, because it would take the session over and
+the next round would fail. Two stops mean nothing ran and the round was not
+counted; run the same command again once the cause is gone:
+- "the Codex session ... is open somewhere else": ask the user to close that
+  window and wait a minute.
+- "... is still working in session ...": a turn typed in a Codex window, or one
+  left by a killed round, is still running. Wait for it, or ask the user to
+  stop it with Esc.
 
 Sol runs in Codex's sandbox: it can write only inside its worktree, its
 commands have no network, and it cannot commit (the script commits what it
