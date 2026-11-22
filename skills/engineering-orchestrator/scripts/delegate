@@ -16,6 +16,12 @@ With `start --check CMD` the script runs CMD itself when a worker says it has fi
 and sends a failure straight back into the worker's session (once per round) before the
 driver is involved.
 
+Before any code, `delegate review` asks the worker to review the brief and the seeded acceptance
+tests without implementing (at most $ENG_ORCH_MAX_REVIEWS rounds, 3 by default). The worker writes
+nothing in a review: any file it changes is discarded. Reviews are not worker rounds: they count
+neither toward the round limit nor in `stats`' first-pass rate. `delegate start` on a reviewed
+task then runs the first implementation round in the same session.
+
 As a worker's round starts, the script prints the command that follows it live. A Codex
 round runs inside the Codex service (the background `codex app-server` that the Codex app and
 `codex resume` windows talk to), so `codex resume <id>` follows it live and can stay open
@@ -34,6 +40,9 @@ Commands (run from inside the project's git repository):
   delegate start <task> --spec FILE [--typist sol-codex|deepseek-opencode|opus]
                         [--tests DIR] [--check CMD]
                         [--plan FILE] [--signoff] [--base REF] [--timeout MIN]
+  delegate review <task> --spec FILE [--tests DIR] [--reply FILE] [--check CMD]
+                         [--typist ...] [--plan FILE] [--signoff] [--base REF] [--timeout MIN]
+                                            review the brief and tests before any code (up to 3)
   delegate fix <task> --feedback FILE [--stage] [--check CMD] [--timeout MIN]
   delegate round <task>                     close a round typed by the opus-typist subagent
   delegate takeover <task> --reason TEXT    the driver takes the task over from the typist
@@ -126,6 +135,8 @@ TYPIST_AGENTS = {"opus-typist"}
 SEATS = ("driver", "judge", "typist", "helpers")
 
 MAX_ROUNDS = int(os.environ.get("ENG_ORCH_MAX_ROUNDS", "6"))
+MAX_REVIEWS = int(os.environ.get("ENG_ORCH_MAX_REVIEWS", "3"))
+REVIEW_SECTIONS = ("verdict", "blockers", "questions")
 DEFAULT_TIMEOUT_MIN = int(os.environ.get("ENG_ORCH_TIMEOUT_MIN", "45"))
 MAX_BRIEF_BYTES = 100_000  # one argv entry is capped near 128 KiB on Linux
 REPORT_PRINT_CHARS = 1500     # fallback when the report has no recognisable sections
@@ -165,6 +176,37 @@ Finish with exactly this report:
 ### Blockers
 """
 
+REVIEW_CONTRACT = """\
+You are the implementation worker. Before any code is written, the architect asks you to
+review the brief below and the acceptance tests it names. Do not implement anything now.
+
+Rules:
+- Work only inside the current directory. It is a git worktree on your own task branch.
+- Do not change, add or delete any file, and do not commit. Every change you leave is
+  discarded when you finish. You may run commands that only read, and the acceptance tests
+  (they are expected to fail for the missing code).
+- Read the brief, the acceptance tests, and the code they touch. Report:
+  a test that cannot pass even with a correct implementation (a fixture that cannot be
+  built, a wrong path or name, a helper that shadows the test framework, an assertion that
+  contradicts the brief, a rule in an existing test that the brief's new files would break);
+  a test that checks the wrong thing; a rule of the brief that contradicts the code, another
+  rule or a test; anything the brief leaves open that you would otherwise have to guess.
+- Give evidence for each point: the file and line, and a command with its actual output.
+- Do not report style preferences or choices the brief deliberately leaves to you.
+
+Finish with exactly this report:
+
+## REVIEW
+### Verdict
+READY (nothing blocks a correct implementation) or BLOCKERS.
+### Blockers
+Numbered. For each: file and line, the problem, the evidence, what would fix it.
+### Questions
+Numbered. What the brief leaves open, and the reading you would take.
+### Checked
+What you read and ran.
+"""
+
 GIT_RULE = {
     "opencode": "- You may commit on this branch. Do not push, merge, switch branches, or touch git\n"
                 "  configuration.",
@@ -178,13 +220,13 @@ class Fail(Exception):
     pass
 
 
-def report_digest(report):
+def report_digest(report, sections=DIGEST_SECTIONS):
     """Only the parts of the worker's report the reviewer needs; the full text stays on disk."""
     keep, cur = [], None
     for line in report.splitlines():
         if line.startswith("### "):
             cur = line[4:].strip().lower()
-        if cur and any(cur.startswith(sec) for sec in DIGEST_SECTIONS):
+        if cur and any(cur.startswith(sec) for sec in sections):
             keep.append(line)
     text = "\n".join(keep).strip()
     return text if text else report[:REPORT_PRINT_CHARS]
@@ -232,6 +274,39 @@ def seed_tests(src: Path, wt: Path, task):
         raise Fail(f"the files in {src} are already in the repository unchanged: they test nothing new.")
     git([*ident(wt), "commit", "-q", "--no-verify", "-m", f"eng-orch({task}): acceptance tests"], wt)
     return dict(commit=git(["rev-parse", "HEAD"], wt).stdout.strip(), files=rel)
+
+
+def reseed_tests(st, src: Path):
+    """Commit the driver's corrected acceptance tests into the worktree and make them the seeded set.
+    Returns the paths that changed (none when the files are already there unchanged)."""
+    wt, src = Path(st["worktree"]), src.resolve()
+    rel = sorted(str(p.relative_to(src)) for p in src.rglob("*") if p.is_file())
+    if not rel:
+        raise Fail(f"{src} holds no files. Put the acceptance tests there at their repository-relative paths.")
+    for r in rel:
+        dest = wt / r
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src / r, dest)
+    git(["add", "--", *rel], wt)
+    changed = git(["diff", "--cached", "--name-only"], wt).stdout.split()
+    if not changed:
+        return []
+    git([*ident(wt), "commit", "-q", "--no-verify", "-m", f"eng-orch({st['task']}): acceptance tests, re-seeded"], wt)
+    old = (st.get("tests") or {}).get("files", [])
+    st["tests"] = dict(commit=git(["rev-parse", "HEAD"], str(wt)).stdout.strip(), files=sorted({*old, *rel}))
+    save_state(st)
+    return changed
+
+
+def discard(st, head):
+    """Put the worktree back at `head`, dropping whatever a review turn changed. Returns True if it did."""
+    wt = st["worktree"]
+    moved = git(["rev-parse", "HEAD"], wt).stdout.strip() != head
+    dirty = bool(git(["status", "--porcelain"], wt).stdout.strip())
+    if moved or dirty:
+        git(["reset", "-q", "--hard", head], wt)
+        git(["clean", "-q", "-fd"], wt)
+    return moved or dirty
 
 
 def repo_root():
@@ -1111,61 +1186,80 @@ def self_check(st, n, k):
     return False, rc if rc != 0 else 1, "\n".join(parts) + "\n"
 
 
-def worker_round(st, body, kind, timeout_min, fix=False):
+def worker_round(st, body, kind, timeout_min, fix=False, review=False):
+    """One worker round. With `review`, a review of the brief and tests before any code: the worker
+    writes nothing (its changes are discarded), there is no self-check, and the round is counted
+    as a review, not as a worker round."""
     d = Path(st["state_dir"])
     wt = st["worktree"]
     w = WORKERS[typist_name(st.get("typist", "deepseek"))]
     model = model_of(w, fix)
-    n = st["rounds"] + 1
-    if n > MAX_ROUNDS:
-        raise Fail(
-            f"round limit reached ({MAX_ROUNDS}) for task '{st['task']}'. Do not keep looping:\n"
-            "reassess the design, find the underlying blocker, and report to the user."
-        )
-    contract = WORKER_CONTRACT.replace("@GIT_RULE@", GIT_RULE[w["runner"]])
-    brief = f"{contract}\n---\n# {kind} (round {n}, task {st['task']})\n\n{body.strip()}\n"
+    if review:
+        n, unit, limit = st.get("reviews", 0) + 1, "review", MAX_REVIEWS
+        if n > MAX_REVIEWS:
+            raise Fail(f"review limit reached ({MAX_REVIEWS}) for task '{st['task']}'. Settle what is left: a "
+                       "question of fact by running the test, a question of intent with the user, a design "
+                       f"question with the architect. Then `delegate start {st['task']} --spec FILE`.")
+        contract = REVIEW_CONTRACT
+    else:
+        n, unit, limit = st["rounds"] + 1, "round", MAX_ROUNDS
+        if n > MAX_ROUNDS:
+            raise Fail(
+                f"round limit reached ({MAX_ROUNDS}) for task '{st['task']}'. Do not keep looping:\n"
+                "reassess the design, find the underlying blocker, and report to the user."
+            )
+        contract = WORKER_CONTRACT.replace("@GIT_RULE@", GIT_RULE[w["runner"]])
+    brief = f"{contract}\n---\n# {kind} ({unit} {n}, task {st['task']})\n\n{body.strip()}\n"
     if len(brief.encode()) > MAX_BRIEF_BYTES:
         raise Fail(f"brief is {len(brief.encode())} bytes; keep it under {MAX_BRIEF_BYTES}. Split the task.")
-    (d / f"round-{n}.brief.md").write_text(brief)
+    stem = f"{unit}-{n}"
+    (d / f"{stem}.brief.md").write_text(brief)
 
     head_before = git(["rev-parse", "HEAD"], wt).stdout.strip()
     main_before = (git(["rev-parse", "HEAD"], st["repo"]).stdout, git(["status", "--porcelain"], st["repo"]).stdout)
     deadline, started = time.monotonic() + timeout_min * 60, time.time()
-    print(f"== worker round {n} ({kind}) for task '{st['task']}' is running on {model} ==", flush=True)
-    rc, timed_out, report, errors, errlog = worker_turn(st, w, model, brief, f"round-{n}", timeout_min * 60)
+    print(f"== worker {unit} {n} ({kind}) for task '{st['task']}' is running on {model} ==", flush=True)
+    rc, timed_out, report, errors, errlog = worker_turn(st, w, model, brief, stem, timeout_min * 60)
     if rc != 0 and w["runner"] == "codex" and session_in_use(errlog):
         raise Fail(f"the Codex session {st['session_id']} is open somewhere else (a `codex resume` window or "
                    "the Codex app), so Codex refused this round before it started. Nothing ran, and the round "
                    "was not counted. Ask the user to close that window; Codex lets go of the session about a "
                    "minute later. Then run the same command again. To follow a round, use "
                    f"`delegate watch {st['task']}`: it only reads, so it cannot block a round.")
-    # Capture whatever the worker left behind, so the diff is complete and reviewable.
-    committed = capture(st, f"worker round {n}")
+    # Capture whatever the worker left behind, so the diff is complete and reviewable. A review writes
+    # nothing: whatever it changed is dropped.
+    discarded = discard(st, head_before) if review else False
+    committed = False if review else capture(st, f"worker round {n}")
 
     # Self-check. A worker that stopped early or broke an acceptance test hears about it here, in its
     # own session and at cached-input prices, instead of costing the driver a review and a correction
     # round. It is not a worker round and does not replace `delegate verify`.
     checks = []
-    while st.get("selfcheck") and rc == 0 and not timed_out:
+    while st.get("selfcheck") and not review and rc == 0 and not timed_out:
         k = len(checks) + 1
         passed, check_rc, feedback = self_check(st, n, k)
         checks.append({"exit": check_rc, "passed": passed})
         left = deadline - time.monotonic()
         if passed or k > SELFCHECK_RETRIES or left < 120:
             break
-        rc, timed_out, again, more, errlog = worker_turn(st, w, model, feedback, f"round-{n}.selfcheck-{k}", left,
+        rc, timed_out, again, more, errlog = worker_turn(st, w, model, feedback, f"{stem}.selfcheck-{k}", left,
                                                          announce=False)   # same session, already printed
         report, errors = again or report, errors + [e for e in more if e not in errors]
         committed = capture(st, f"worker round {n}, after self-check {k}") or committed
-    (d / f"round-{n}.report.md").write_text(report + "\n")
+    (d / f"{stem}.report.md").write_text(report + "\n")
     head_after = git(["rev-parse", "HEAD"], wt).stdout.strip()
 
-    entry = {"round": n, "kind": kind, "model": model, "exit": rc, "timed_out": timed_out,
+    entry = {unit: n, "kind": kind, "model": model, "exit": rc, "timed_out": timed_out,
              "head": head_after, "at": now()}
     if checks:
         entry["selfcheck"] = checks
-    st.update(rounds=n, updated=now())
-    st.setdefault("history", []).append(entry)
+    if review:
+        entry["discarded"] = discarded
+        st.update(reviews=n, updated=now())
+        st.setdefault("review_history", []).append(entry)
+    else:
+        st.update(rounds=n, updated=now())
+        st.setdefault("history", []).append(entry)
     save_state(st)
 
     session_id = st.get("session_id")
@@ -1183,7 +1277,7 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     escaped = main_after != main_before
     misplaced = ran_in is not None and Path(ran_in).resolve() != Path(wt).resolve()
 
-    print(f"== worker round {n} ({kind}) for task '{st['task']}' ==")
+    print(f"== worker {unit} {n} ({kind}) for task '{st['task']}' ==")
     print(f"worktree   {wt}")
     print(f"branch     {st['branch']}   base {st['base'][:10]}")
     print(f"session    {session_id}")
@@ -1208,9 +1302,14 @@ def worker_round(st, body, kind, timeout_min, fix=False):
         print(f"sandbox    {', '.join(sorted(sandboxes)) if sandboxes else 'UNKNOWN (no session record found)'}"
               f"{'   <-- NOT ' + CODEX_SANDBOX if unsandboxed else ''}")
     print(f"ran in     {ran_in or 'UNKNOWN'}{'   <-- NOT THE WORKTREE' if misplaced else ''}")
-    print(f"rounds     {n}/{MAX_ROUNDS}")
-    print(f"changed    {'yes' if head_after != head_before else 'NO CHANGES this round'}"
-          f"{' (uncommitted work captured by this script)' if committed else ''}")
+    if review:
+        print(f"reviews    {n}/{limit}   (worker rounds so far {st['rounds']}/{MAX_ROUNDS}; a review is not one)")
+        print("changed    " + ("the worker changed files during the review: DISCARDED" if discarded else
+                                "nothing (a review writes nothing)"))
+    else:
+        print(f"rounds     {n}/{limit}")
+        print(f"changed    {'yes' if head_after != head_before else 'NO CHANGES this round'}"
+              f"{' (uncommitted work captured by this script)' if committed else ''}")
     if checks:
         last = checks[-1]
         how = "PASS" if last["passed"] else f"STILL FAILING (exit {last['exit']})"
@@ -1218,12 +1317,13 @@ def worker_round(st, body, kind, timeout_min, fix=False):
             how += ", after the first run failed and the failure was sent back to the worker"
         print(f"self-check {how}")
         print(f"           {st['selfcheck']}   log {d / f'round-{n}.selfcheck-{len(checks)}.log'}")
-    elif st.get("selfcheck"):
+    elif st.get("selfcheck") and not review:
         print("self-check not run (the worker's turn did not finish cleanly)")
-    stat = git(["diff", "--stat", f"{st['base']}..HEAD"], wt).stdout.strip()
-    print("\n-- diff vs base (measured by this script) --")
-    print(stat or "(empty)")
-    print(f"\nfull diff:  git -C {shlex.quote(wt)} diff {st['base'][:10]}..HEAD")
+    if not review:
+        stat = git(["diff", "--stat", f"{st['base']}..HEAD"], wt).stdout.strip()
+        print("\n-- diff vs base (measured by this script) --")
+        print(stat or "(empty)")
+        print(f"\nfull diff:  git -C {shlex.quote(wt)} diff {st['base'][:10]}..HEAD")
     if errors:
         print(f"\n-- reported by {RUNNER_NAME[w['runner']]} --")
         print("\n".join(errors[:5]))
@@ -1231,10 +1331,16 @@ def worker_round(st, body, kind, timeout_min, fix=False):
     if rc != 0 and tail:
         print("\n-- stderr (tail) --")
         print(tail[-1500:])
-    print("\n-- WORKER REPORT DIGEST (a claim, not evidence; verify it) --")
-    print(report_digest(report) if report else "(the worker produced no final report)")
-    print(f"full report: {d / f'round-{n}.report.md'}")
-    if checks and not checks[-1]["passed"]:
+    print(f"\n-- WORKER {'REVIEW' if review else 'REPORT'} DIGEST (a claim, not evidence; verify it) --")
+    print(report_digest(report, REVIEW_SECTIONS if review else DIGEST_SECTIONS) if report else
+          "(the worker produced no final report)")
+    print(f"full report: {d / f'{stem}.report.md'}")
+    if review:
+        more = (f"`delegate review {st['task']} --reply FILE [--spec FILE] [--tests DIR]` for review {n + 1}, or "
+                if n < limit else "")
+        print("\nnext: check each point (run the test it names). Fix the brief or the tests, or write why a point "
+              f"stands, then {more}`delegate start {st['task']} --spec FILE [--tests DIR]` once nothing blocks.")
+    elif checks and not checks[-1]["passed"]:
         print("\nnext: the self-check still fails. Read its log and the diff, then send the one correction "
               f"(`delegate fix {st['task']}`) or take over.")
     else:
@@ -1336,12 +1442,13 @@ def codex_event_lines(ev, wt, label):
 
 
 def turn_files(d: Path):
-    """The events files of the task's worker turns, in order: round-N, then its self-check retries."""
+    """The events files of the task's worker turns, in order: its reviews, then round-N and each round's
+    self-check retries."""
     found = []
-    for p in d.glob("round-*.events.jsonl"):
-        m = re.fullmatch(r"round-(\d+)(?:\.selfcheck-(\d+))?\.events\.jsonl", p.name)
+    for p in [*d.glob("review-*.events.jsonl"), *d.glob("round-*.events.jsonl")]:
+        m = re.fullmatch(r"(review|round)-(\d+)(?:\.selfcheck-(\d+))?\.events\.jsonl", p.name)
         if m:
-            found.append(((int(m.group(1)), int(m.group(2) or 0)), p))
+            found.append(((m.group(1) == "round", int(m.group(2)), int(m.group(3) or 0)), p))
     return [p for _, p in sorted(found)]
 
 
@@ -1593,25 +1700,81 @@ def cmd_check(a):
     print("preflight passed")
 
 
-def cmd_start(a):
-    root = repo_root()
-    task = task_name(a.task)
-    worker = a.typist in WORKERS
+def read_spec(path):
+    spec = Path(path).read_text()
+    if not spec.strip():
+        raise Fail("spec file is empty.")
+    return spec
+
+
+def check_start_args(a, root, worker):
     if a.check is not None and not a.check.strip():
         raise Fail("--check needs a command, e.g. --check 'pytest -q tests/test_x.py'")
     if worker and (root / OPT_OUT_MARKER).exists():
         raise Fail(f"{root} contains {OPT_OUT_MARKER}: this repository's code must not be sent to the "
                    "worker's provider. Implement directly.")
-    spec = Path(a.spec).read_text()
-    if not spec.strip():
-        raise Fail("spec file is empty.")
     if a.plan and (not Path(a.plan).is_file() or not Path(a.plan).read_text().strip()):
         raise Fail(f"plan file {a.plan} is missing or empty.")
     if a.tests and not Path(a.tests).is_dir():
         raise Fail(f"tests directory {a.tests} does not exist.")
+
+
+def reviewed(st):
+    """A task whose worker has reviewed the brief and has not started implementing it."""
+    return bool(st.get("reviews")) and st["rounds"] == 0 and not st.get("open_round") and not st.get("integrated")
+
+
+def update_reviewed(st, a, worker):
+    """Bring a reviewed task up to the driver's latest files: tests, self-check, plan."""
+    if a.tests:
+        changed = reseed_tests(st, Path(a.tests))
+        print(f"re-seeded {len(changed)} acceptance test file(s) at {st['tests']['commit'][:10]}: "
+              f"{', '.join(changed)}\n" if changed else "acceptance tests unchanged\n")
+    if a.check is not None and worker:
+        st["selfcheck"] = a.check.strip()
+    if a.plan:
+        src, d = Path(a.plan).resolve(), Path(st["state_dir"])
+        if src != (d / "plan.md").resolve():
+            shutil.copyfile(src, d / "plan.md")
+        st.update(designer="fable", signoff_required=True)
+    if getattr(a, "signoff", False):
+        st["signoff_required"] = True
+    save_state(st)
+
+
+def cmd_start(a):
+    root = repo_root()
+    task = task_name(a.task)
     d = state_dir(root, task)
     if (d / "state.json").exists():
-        raise Fail(f"task '{task}' already exists. Use `delegate fix {task}` or pick another name.")
+        st = load_state(root, task)
+        if not reviewed(st):
+            raise Fail(f"task '{task}' already exists. Use `delegate fix {task}` or pick another name.")
+        # The worker reviewed the brief: its first implementation round runs in the same session.
+        typist = typist_name(st.get("typist", "deepseek"))
+        if a.typist != typist:
+            print(f"note: task '{task}' keeps its typist {typist}.\n")
+        check_start_args(a, root, True)
+        spec = read_spec(a.spec)
+        preflight(typist)
+        with Lock(d):
+            update_reviewed(st, a, True)
+            worker_round(st, spec, "IMPLEMENTATION BRIEF", a.timeout)
+        return
+    st, spec = create_task(a, root, task)
+    with Lock(d):
+        if a.typist in WORKERS:
+            worker_round(st, spec, "IMPLEMENTATION BRIEF", a.timeout)
+        else:
+            open_round(st, spec, "IMPLEMENTATION BRIEF")
+
+
+def create_task(a, root, task):
+    """The worktree, the seeded tests and the task's state, before its first round or review."""
+    worker = a.typist in WORKERS
+    check_start_args(a, root, worker)
+    spec = read_spec(a.spec)
+    d = state_dir(root, task)
     if worker:
         preflight(a.typist)
     base = git(["rev-parse", "--verify", f"{a.base}^{{commit}}"], root, check=False)
@@ -1656,11 +1819,61 @@ def cmd_start(a):
     if dirty:
         print("note: the main checkout has uncommitted changes; the worker starts from the commit "
               f"{base[:10]} and will NOT see them.\n")
+    return st, spec
+
+
+def cmd_review(a):
+    """A review round: the worker reads the brief and the seeded tests and reports what would block a
+    correct implementation, before any code. The first review creates the task as `start` would."""
+    root = repo_root()
+    task = task_name(a.task)
+    if a.typist not in WORKERS:
+        raise Fail("review rounds are for the workers (sol-codex, deepseek-opencode). The opus typist is a "
+                   "subagent the driver calls itself.")
+    d = state_dir(root, task)
+    if not (d / "state.json").exists():
+        if not a.spec:
+            raise Fail("the first review needs --spec FILE (the brief), and --tests DIR for the acceptance tests.")
+        if a.reply:
+            raise Fail("--reply answers an earlier review; this is the task's first.")
+        st, spec = create_task(a, root, task)
+        body = spec.strip()
+        if st.get("tests"):
+            body += ("\n\n---\nAcceptance tests seeded in this worktree (commit "
+                     f"{st['tests']['commit'][:10]}): {', '.join(st['tests']['files'])}")
+        (d / "spec.md").write_text(spec)
+        with Lock(d):
+            worker_round(st, body, "REVIEW REQUEST - brief and tests, before any code", a.timeout, review=True)
+        return
+    st = load_state(root, task)
+    if not reviewed(st) and (st["rounds"] or st.get("open_round") or st.get("integrated")):
+        raise Fail(f"task '{task}' has begun implementing; reviews come before the first round. "
+                   f"Use `delegate fix {task}`.")
+    typist = typist_name(st.get("typist", "deepseek"))
+    if typist not in WORKERS:
+        raise Fail("review rounds are for the workers; this task's typist is the opus subagent.")
+    if st.get("reviews", 0) >= MAX_REVIEWS:
+        raise Fail(f"review limit reached ({MAX_REVIEWS}) for task '{task}'. Settle what is left: a question of "
+                   "fact by running the test, a question of intent with the user, a design question with the "
+                   f"architect. Then `delegate start {task} --spec FILE`.")
+    if not a.reply:
+        raise Fail("--reply FILE is needed: your answer to the last review (what you fixed, and why any point stands).")
+    reply = Path(a.reply).read_text()
+    if not reply.strip():
+        raise Fail("reply file is empty.")
+    check_start_args(a, root, True)
+    spec = read_spec(a.spec) if a.spec else (d / "spec.md").read_text()
+    preflight(typist)
     with Lock(d):
-        if worker:
-            worker_round(st, spec, "IMPLEMENTATION BRIEF", a.timeout)
-        else:
-            open_round(st, spec, "IMPLEMENTATION BRIEF")
+        before = (st.get("tests") or {}).get("commit")
+        update_reviewed(st, a, True)
+        if a.spec:
+            (d / "spec.md").write_text(spec)
+        body = f"## The architect's answer to your last review\n\n{reply.strip()}\n\n## The brief now\n\n{spec.strip()}"
+        if st.get("tests") and st["tests"]["commit"] != before:
+            body += (f"\n\n---\nThe acceptance tests were re-seeded at {st['tests']['commit'][:10]}; read them "
+                     "again from the worktree.")
+        worker_round(st, body, "REVIEW REQUEST - again, after the architect's answer", a.timeout, review=True)
 
 
 def cmd_fix(a):
@@ -1934,7 +2147,8 @@ def cmd_stats(a):
                          cost=(st.get("worker_usage") or {}).get("cost"),
                          sc_failed=sum(not c[0]["passed"] for c in checks),
                          sc_recovered=sum(len(c) > 1 and c[-1]["passed"] for c in checks),
-                         rounds=st["rounds"], verifies=len(evs), failed=sum(e["exit"] != 0 for e in evs),
+                         rounds=st["rounds"], reviews=st.get("reviews", 0),
+                         verifies=len(evs), failed=sum(e["exit"] != 0 for e in evs),
                          first=None if not evs else evs[0]["exit"] == 0, takeover=bool(st.get("takeover")),
                          signoffs=len(sos), changes=sum(s["verdict"] == "CHANGES" for s in sos),
                          integrated=st.get("integrated", False)))
@@ -1956,6 +2170,14 @@ def cmd_stats(a):
         print(f"passed the first verification: {ok} of {len(verified)} ({100 * ok / len(verified):.0f}%)")
     taken = sum(1 for r in rows if r["takeover"])
     print(f"taken over by the driver: {taken} of {len(rows)} ({100 * taken / len(rows):.0f}%)")
+    reviewed = [r for r in rows if r["reviews"]]
+    if reviewed:
+        line = (f"reviewed by the worker before any code: {len(reviewed)} of {len(rows)} tasks, "
+                f"{sum(r['reviews'] for r in reviewed)} reviews")
+        v = [r for r in reviewed if r["first"] is not None]
+        if v:
+            line += f"; of those, passed the first verification {sum(r['first'] for r in v)} of {len(v)}"
+        print(line)
     if signed:
         caught = sum(1 for r in signed if r["changes"])
         print(f"architect sign-offs on {len(signed)} tasks; {caught} returned CHANGES at least once "
@@ -2036,6 +2258,7 @@ def cmd_status(a):
         else:
             sgate = so["verdict"]
         print(f"{t}: designer {st.get('designer', 'opus')}, typist {typist_name(st.get('typist', 'deepseek'))}, "
+              f"{'reviews %d/%d, ' % (st['reviews'], MAX_REVIEWS) if st.get('reviews') else ''}"
               f"rounds {st['rounds']}/{MAX_ROUNDS}"
               f"{' (round %d open)' % st['open_round']['n'] if st.get('open_round') else ''}"
               f"{' (taken over by the driver)' if st.get('takeover') else ''}, "
@@ -2091,6 +2314,17 @@ def main():
     s.add_argument("--signoff", action="store_true", help="require architect sign-off (risky change)")
     s.add_argument("--base", default="HEAD"); s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MIN)
     s.set_defaults(fn=cmd_start)
+    s = sub.add_parser("review", help="the worker reviews the brief and the tests before any code; writes nothing")
+    s.add_argument("task")
+    s.add_argument("--spec", help="the brief (required for the first review; later, a corrected brief)")
+    s.add_argument("--reply", help="your answer to the last review: what you fixed, and why any point stands")
+    s.add_argument("--typist", type=typist_name, choices=TYPISTS, default=DEFAULT_TYPIST)
+    s.add_argument("--tests", help="acceptance tests at repository-relative paths; seeded (or re-seeded) first")
+    s.add_argument("--check", metavar="CMD", help="the self-check the implementation rounds will run")
+    s.add_argument("--plan", help="architect's plan; makes sign-off mandatory before integrate")
+    s.add_argument("--signoff", action="store_true", help="require architect sign-off (risky change)")
+    s.add_argument("--base", default="HEAD"); s.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MIN)
+    s.set_defaults(fn=cmd_review)
     s = sub.add_parser("fix")
     s.add_argument("task"); s.add_argument("--feedback", required=True)
     s.add_argument("--stage", action="store_true",
