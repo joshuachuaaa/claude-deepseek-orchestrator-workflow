@@ -24,8 +24,8 @@ description: Plan, build, review and accept a substantial coding task with Opus 
   from a brief, in its own git worktree. You never talk to a worker: you write
   a file and run `delegate`. There are two, and they are interchangeable: the
   same brief, the same gate, the same commands.
-  - `sol-codex`: GPT-6.2 Sol through the Codex CLI, at xhigh effort for every
-    round. The default.
+  - `sol-codex`: GPT-6.2 Sol through the Codex CLI, at xhigh effort and Codex's
+    Fast speed for every round. The default.
   - `deepseek-opencode`: DeepSeek V4.1 Flash through OpenCode, at max effort.
 
 ## Which worker
@@ -366,9 +366,9 @@ task keeps the numbers clean.
 - **`.no-delegate`:** no worker. You type.
 - **`.no-fable`:** no Fable subagents. You design, sign-off and the consult are
   skipped; say so.
-- **Worker unreachable** (`delegate check` fails, provider down, model mismatch):
-  stop and tell the user. Never substitute another worker model, and do not
-  quietly implement the task yourself in its place. This is different from
+- **Worker unreachable** (`delegate check` fails, provider down, model or speed
+  mismatch): stop and tell the user. Never substitute another worker model, and
+  do not quietly implement the task yourself in its place. This is different from
   Step 6: a takeover follows a worker that ran and failed the gate, and is
   recorded.
 - **Fable unavailable** (usage limit, error, or a model fallback reported): stop
