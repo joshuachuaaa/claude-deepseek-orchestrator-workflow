@@ -24,8 +24,8 @@ description: Plan, build, review and accept a substantial coding task with Opus 
   from a brief, in its own git worktree. You never talk to a worker: you write
   a file and run `delegate`. There are two, and they are interchangeable: the
   same brief, the same gate, the same commands.
-  - `sol-codex`: GPT-6.2 Sol through the Codex CLI, at xhigh effort for every
-    round. The default.
+  - `sol-codex`: GPT-6.2 Sol through the Codex CLI, at xhigh effort and Codex's
+    Fast speed for every round. The default.
   - `deepseek-opencode`: DeepSeek V4.1 Flash through OpenCode, at max effort.
 
 ## Which worker
@@ -173,6 +173,42 @@ behaviour is right.
 
 The held-back checks stay in holdback.md. They are not acceptance tests and the
 worker never sees them.
+
+Before the worker sees the tests, run them against a throwaway stub of the
+planned code (the new names with empty bodies, the new routes answering
+nothing). Failing on the base commit is not enough: a missing module hides
+every other fault. The stub run surfaces a helper that shadows the test
+framework, a wrong path, a fixture that cannot be built, or an older test
+that the new files would break.
+
+## Step 3d. The worker reviews the brief and the tests (worker path)
+
+Before any code, the worker reviews brief.md and the seeded tests. It writes
+nothing: the script discards any change it makes, runs no self-check, and does
+not count a review as a worker round.
+
+    delegate review <task> [--typist <worker>] --spec <dir>/brief.md --tests <dir>/tests --check '<acceptance test command>' [--plan <dir>/plan.md] [--signoff]
+
+The first review creates the task as `delegate start` would, with the same
+options. Run it in the background like a round and give the user the line that
+follows it. The worker answers with a verdict (READY or BLOCKERS), numbered
+blockers with evidence, and questions the brief leaves open.
+
+Check each point yourself (run the test it names). Fix the brief or the tests,
+or write why a point stands, in `<dir>/review-reply-<n>.md`, then:
+
+    delegate review <task> --reply <dir>/review-reply-<n>.md [--spec <dir>/brief.md] [--tests <dir>/tests]
+
+`--tests` re-seeds the corrected tests (only changed files make a commit), and
+`--spec` sends the corrected brief. At most three reviews per task. Stop
+reviewing when the worker says READY and you agree. Settle any point still
+open after the third review yourself: a question of fact by running the test,
+a question of intent with the user, a design question with the architect
+(Fable, if it designed). Then go to Step 4: `delegate start` on a reviewed task
+runs the first implementation round in the same session.
+
+Skip the review only for a change small enough that a stopped round would cost
+less than the review.
 
 ## Step 4. Implement
 
@@ -366,9 +402,9 @@ task keeps the numbers clean.
 - **`.no-delegate`:** no worker. You type.
 - **`.no-fable`:** no Fable subagents. You design, sign-off and the consult are
   skipped; say so.
-- **Worker unreachable** (`delegate check` fails, provider down, model mismatch):
-  stop and tell the user. Never substitute another worker model, and do not
-  quietly implement the task yourself in its place. This is different from
+- **Worker unreachable** (`delegate check` fails, provider down, model or speed
+  mismatch): stop and tell the user. Never substitute another worker model, and
+  do not quietly implement the task yourself in its place. This is different from
   Step 6: a takeover follows a worker that ran and failed the gate, and is
   recorded.
 - **Fable unavailable** (usage limit, error, or a model fallback reported): stop
@@ -386,12 +422,15 @@ task keeps the numbers clean.
 - Searching goes through Explore; verification output through test-runner.
 - Do not paste large files or diffs into your own messages; point at paths.
 - Pass work between models as files in the task directory, never as conversation.
+- Worker reviews: at most three per task, before the first round. They are
+  cheaper than a round that stops on a fault in the brief or the tests.
 
 ## Commands
 
     delegate check [--typist sol-codex|deepseek-opencode]   preflight: which worker, its CLI, model, sandbox or agent, sign-in
+    delegate review <task> ...     the worker reviews the brief and tests before any code (up to 3; writes nothing)
     delegate takeover <task> --reason "..."   you take the task over from the worker
     delegate watch <task>          follow a Sol round live, read-only (for the user's terminal)
-    delegate status [<task>]       rounds, verification, sign-off, session
+    delegate status [<task>]       reviews, rounds, verification, sign-off, session
     delegate stats                 every task so far: rounds, first-pass rate, takeovers, CHANGES rate, tokens by seat
     delegate cleanup <task> --force    discard an unintegrated task (ask the user first)
